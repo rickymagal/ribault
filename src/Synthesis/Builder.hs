@@ -33,7 +33,7 @@ import           GHC.Float              (castFloatToWord32)
 import qualified Data.Map              as M
 import qualified Data.Set              as S
 
-import           Analysis.Semantic     (assignSuperNames)
+import           Analysis.Semantic     (assignSuperNames, desugarProgram)
 import           Syntax
 import           Types                  (DGraph(..), Edge, NodeId, emptyGraph, addNode, addEdge)
 import           Port                   (Port(..), (-->))
@@ -811,7 +811,7 @@ getActiveStride = Build $ do
 -- | Build a 'DFG' from a 'Program'. Also assigns super names first.
 buildProgram :: Program -> DFG
 buildProgram p0 =
-  let Program decls = assignSuperNames p0
+  let Program decls = assignSuperNames (desugarProgram p0)
       selfCalls = preScanSelfCalls decls
       (_, st) = runBuild $ do
         Build $ modify (\s -> s { bsSelfCalls = selfCalls })
