@@ -77,12 +77,16 @@ data BuildS = BuildS
   , bsListFuns   :: !(S.Set Ident) -- ^ Functions that build/return lists.
   , bsRetVals    :: !(M.Map Ident Port) -- ^ Return value port for each function.
   , bsGuard      :: !(Maybe Port)  -- ^ Optional guard for gating calls in branches.
+  , bsTopDecls   :: !(M.Map Ident ([Ident], Expr)) -- ^ Top-level functions with parameters.
+  , bsRecFuns    :: !(S.Set Ident) -- ^ Top-level functions on a call cycle.
+  , bsLocalFuns  :: !(S.Set Ident) -- ^ Names bound by local (let) declarations.
+  , bsInLoop     :: !Bool          -- ^ Building inside a loop body (no nested loops).
   , bsScopeK     :: !Int               -- ^ Scope-level call counter for unique k values (reset on withActive).
   }
 
 -- | Initial empty builder state.
 emptyS :: BuildS
-emptyS = BuildS emptyGraph [M.empty] M.empty [] S.empty S.empty M.empty Nothing 0
+emptyS = BuildS emptyGraph [M.empty] M.empty [] S.empty S.empty M.empty Nothing M.empty S.empty S.empty False 0
 
 -- | Builder monad with unique-id generation.
 newtype Build a = Build { unBuild :: StateT BuildS Unique a }
@@ -692,7 +696,10 @@ matchVal v pat = case (pat, v) of
 buildProgram :: Program -> DFG
 buildProgram p0 =
   let Program decls = assignSuperNames (desugarProgram p0)
+      tops = M.fromList [ (f, (ps, b)) | FunDecl f ps b <- decls, not (null ps) ]
       (_, st) = runBuild $ do
+        Build $ modify (\s -> s { bsTopDecls = tops
+                                 , bsRecFuns  = recursiveFuns decls })
         mapM_ (\(FunDecl f ps body) -> insertB f (BLam ps body)) decls
         mapM_ buildZero decls
   in bsGraph st
@@ -751,6 +758,10 @@ ensureBuilt f ps body = do
        when (exprHasFloat body) (markFloatFun f)
        -- Create the ret node first so recursive call sites can target it.
        retN <- retNodeId f
+       -- A function body runs in its own exec, so loops are allowed in it
+       -- even when the call site sits inside a loop.
+       inLoop0 <- Build $ gets bsInLoop
+       Build $ modify (\s -> s { bsInLoop = False })
        _ <- withActive f $ withNoGuard $ withEnv $ do
               forM_ (zip [0..] ps) $ \(i, v) -> do
                 let slot = i + 1
@@ -760,6 +771,7 @@ ensureBuilt f ps body = do
               -- TALM ret: port 0 = result (callee exec), port 1 = return
               -- addresses from the retsnds of every call site.
               connectPlus res (InstPort retN "0")
+       Build $ modify (\s -> s { bsInLoop = inLoop0 })
        pure ()
 
 -- variável livre -> NArg
@@ -973,7 +985,9 @@ staticStream xs = do
 
 -- | Insert a function lambda into the environment.
 goDecl :: Decl -> Build ()
-goDecl (FunDecl f ps body) = insertB f (BLam ps body)
+goDecl (FunDecl f ps body) = do
+  Build $ modify (\s -> s { bsLocalFuns = S.insert f (bsLocalFuns s) })
+  insertB f (BLam ps body)
 
 -- Aplicação n-ária -----------------------------------------------------
 
@@ -1085,7 +1099,31 @@ goApp fun args = case fun of
   --                                 the caller exec; consumers read f.cg
   -- Call instances are told apart by exec, so tags pass through unchanged.
   Var f -> do
+    vals <- mapM goExpr args
+    lowered <- lowerCall f vals
+    case lowered of
+      Just v  -> pure v
+      Nothing -> talmCall f vals
+
+  -- Lambda applied in place: beta-reduce by binding formals to the actuals.
+  Lambda ps body -> do
     argv0 <- mapM goScalar args
+    argv1 <- mapM guardIfNeeded argv0
+    argv <- alignExecInputs argv1
+    withEnv $ do
+      forM_ (zip ps argv) $ \(v, a) -> insertB v (BVal (Scalar a))
+      goExpr body
+
+  _ -> do
+    _ <- mapM goExpr args
+    case args of
+      [] -> Scalar <$> constI 0
+      _  -> goExpr (last args)
+
+-- | Plain TALM call of @f@ (arguments in scalar form).
+talmCall :: Ident -> [Val] -> Build Val
+talmCall f vals = do
+    argv0 <- mapM asScalar vals
     argv1 <- mapM guardIfNeeded argv0
     argv <- alignExecInputs argv1
     anyFloat <- or <$> mapM portIsFloat argv
@@ -1116,20 +1154,318 @@ goApp fun args = case fun of
     connectPlus (out0 rs) (InstPort retN "1")
     pure (Scalar (InstPort retN (callgroupPort cg)))
 
-  -- Lambda applied in place: beta-reduce by binding formals to the actuals.
-  Lambda ps body -> do
-    argv0 <- mapM goScalar args
-    argv1 <- mapM guardIfNeeded argv0
-    argv <- alignExecInputs argv1
-    withEnv $ do
-      forM_ (zip ps argv) $ \(v, a) -> insertB v (BVal (Scalar a))
-      goExpr body
+-- Laços nativos (recursão linear) ----------------------------------------
+--
+-- A call to a top-level function whose body is a linear self-recursion is
+-- lowered at the call site to a TALM loop instead of a chain of calls:
+--
+-- * Tail recursion   f ps = if c then base else f args'   (either branch order)
+--   Forward loop in the testewhile idiom: every parameter goes through
+--   @inctag [init, feedback]@, the condition steers each one, the continue
+--   side computes args' as feedback, the exit side evaluates base.
+--
+-- * List consumer    f .. xs .. = case xs of [] -> base; (h:t) -> E[h, f .. t ..]
+--   (xs a static stream; the other parameters passed through unchanged).
+--   Element k is placed at tag t0+1+k. The accumulator starts as base at tag
+--   t0+1+N and walks the tags down: each step does inctagi -1 and computes
+--   E with the element that lives at that tag, so the result is exactly the
+--   right fold. A remaining-count r (> 0 continues) is carried alongside.
+--
+-- Loops run in the caller's exec, at tags above the entry tag t0, and hand the
+-- result back at tag t0. Loops are not nested: inside a loop body these calls
+-- stay TALM calls (a fresh exec per call keeps the tags apart).
+--
+-- A call to a non-recursive top-level function with a stream argument is
+-- inlined, so static streams never cross a call boundary as list supers.
 
-  _ -> do
-    _ <- mapM goExpr args
-    case args of
-      [] -> Scalar <$> constI 0
-      _  -> goExpr (last args)
+-- | Shape of a tail-recursive body.
+data TailShape = TailShape
+  { tsCond       :: Expr
+  , tsExitOnTrue :: Bool     -- ^ True: @if c then base else f ..@
+  , tsBase       :: Expr
+  , tsArgs       :: [Expr]   -- ^ arguments of the self-call
+  }
+
+-- | Shape of a list-consumer body.
+data ConsShape = ConsShape
+  { csIdx  :: Int            -- ^ position of the list parameter
+  , csBase :: Expr           -- ^ result for []
+  , csHead :: Maybe Ident    -- ^ head variable (Nothing for _)
+  , csBody :: Expr           -- ^ E with the self-call replaced by 'recVar'
+  }
+
+-- | Name bound to the recursive result inside a consumer step.
+recVar :: Ident
+recVar = "rec#"
+
+-- | Occurrences of variable @x@ in an expression (shadowing ignored).
+occurs :: Ident -> Expr -> Int
+occurs x = \case
+  Var y          -> if x == y then 1 else 0
+  Lit _          -> 0
+  Lambda _ e     -> occurs x e
+  If c t e       -> occurs x c + occurs x t + occurs x e
+  Case s as      -> occurs x s + sum [ occurs x e | (_, e) <- as ]
+  Let ds b       -> sum [ occurs x e | FunDecl _ _ e <- ds ] + occurs x b
+  App a b        -> occurs x a + occurs x b
+  BinOp _ l r    -> occurs x l + occurs x r
+  UnOp _ e       -> occurs x e
+  List es        -> sum (map (occurs x) es)
+  Tuple es       -> sum (map (occurs x) es)
+  Cons h t       -> occurs x h + occurs x t
+  Super _ ins _  -> length (filter (== x) ins)
+
+-- | Saturated self-call @f a1 .. an@?
+selfCall :: Ident -> Int -> Expr -> Maybe [Expr]
+selfCall f n e = case flattenApp e of
+  (Var g, as) | g == f, length as == n -> Just as
+  _                                    -> Nothing
+
+recognizeTail :: Ident -> [Ident] -> Expr -> Maybe TailShape
+recognizeTail f ps = \case
+  If c a b
+    | occurs f c == 0
+    , Just as <- selfCall f (length ps) b, all ((== 0) . occurs f) as
+    , occurs f a == 0 -> Just (TailShape c True a as)
+    | occurs f c == 0
+    , Just as <- selfCall f (length ps) a, all ((== 0) . occurs f) as
+    , occurs f b == 0 -> Just (TailShape c False b as)
+  _ -> Nothing
+
+recognizeConsumer :: Ident -> [Ident] -> Expr -> Maybe ConsShape
+recognizeConsumer f ps = \case
+  Case (Var xs) alts
+    | Just j <- M.lookup xs (M.fromList (zip ps [0..]))
+    , Just (base, hd, tl, e) <- splitAlts alts
+    , occurs f base == 0, occurs xs base == 0
+    , occurs xs e == 0, occurs tl e == 1
+    , Just e' <- replaceCall j tl e
+    , occurs f e' == 0
+    , maybe True (\h -> h /= tl && h `notElem` ps) hd
+    , tl `notElem` ps
+    -> Just (ConsShape j base hd e')
+  _ -> Nothing
+  where
+    splitAlts alts = case alts of
+      [(PList [], b), (PCons ph (PVar t), e)] -> withHead ph b t e
+      [(PCons ph (PVar t), e), (PList [], b)] -> withHead ph b t e
+      _ -> Nothing
+    withHead ph b t e = case ph of
+      PVar h    -> Just (b, Just h, t, e)
+      PWildcard -> Just (b, Nothing, t, e)
+      _         -> Nothing
+    -- Replace the single self-call f p1 .. t .. pn by recVar.
+    replaceCall j tl = go
+      where
+        ok as = and [ case a of
+                        Var v -> if i == j then v == tl else v == ps !! i
+                        _     -> False
+                    | (i, a) <- zip [0..] as ]
+        go e = case selfCall f (length ps) e of
+          Just as | ok as -> Just (Var recVar)
+          Just _          -> Nothing
+          Nothing -> case e of
+            Var _         -> Just e
+            Lit _         -> Just e
+            If c t x      -> If <$> go c <*> go t <*> go x
+            BinOp o l r   -> BinOp o <$> go l <*> go r
+            UnOp o x      -> UnOp o <$> go x
+            App a b       -> App <$> go a <*> go b
+            Cons h t      -> Cons <$> go h <*> go t
+            List es       -> List <$> mapM go es
+            Tuple es      -> Tuple <$> mapM go es
+            Case sc as    -> Case <$> go sc <*> mapM (\(pt, x) -> (,) pt <$> go x) as
+            Let ds b
+              | all (\(FunDecl _ _ x) -> occurs f x == 0) ds -> Let ds <$> go b
+            _             -> if occurs f e == 0 then Just e else Nothing
+
+-- | Top-level functions that lie on a call cycle (self or mutual recursion).
+recursiveFuns :: [Decl] -> S.Set Ident
+recursiveFuns decls =
+  S.fromList [ f | f <- M.keys calls, f `S.member` reach f ]
+  where
+    names = S.fromList [ f | FunDecl f _ _ <- decls ]
+    calls = M.fromList [ (f, S.filter (\g -> occurs g b > 0) names) | FunDecl f _ b <- decls ]
+    reach f = go S.empty (S.toList (M.findWithDefault S.empty f calls))
+      where
+        go seen [] = seen
+        go seen (g:gs)
+          | g `S.member` seen = go seen gs
+          | otherwise = go (S.insert g seen)
+                           (S.toList (M.findWithDefault S.empty g calls) ++ gs)
+
+-- | Lower a call to a loop / inline it when its shape allows; Nothing = TALM call.
+lowerCall :: Ident -> [Val] -> Build (Maybe Val)
+lowerCall f vals = do
+  st <- Build get
+  let isLocal = f `S.member` bsLocalFuns st
+      mdecl   = M.lookup f (bsTopDecls st)
+      isRec   = f `S.member` bsRecFuns st
+      hasStream = any isStreamVal vals
+  case mdecl of
+    Just (ps, body)
+      | not isLocal, length ps == length vals, not (bsInLoop st) ->
+          case (recognizeTail f ps body, recognizeConsumer f ps body) of
+            (Just ts, _) -> Just <$> tailLoop ps ts vals
+            (_, Just cs) | Stream _ xs <- vals !! csIdx cs ->
+                             Just <$> consumerLoop ps cs xs vals
+            _ | not isRec && hasStream -> Just <$> inlineCall ps body vals
+            _ -> pure Nothing
+      | not isLocal, length ps == length vals, not isRec, hasStream ->
+          Just <$> inlineCall ps body vals
+    _ -> pure Nothing
+  where
+    isStreamVal = \case { Stream{} -> True; _ -> False }
+
+-- | Gate a value by the current guard (all of its ports).
+guardVal :: Val -> Build Val
+guardVal = \case
+  Scalar p    -> Scalar <$> guardIfNeeded p
+  Stream c ps -> Stream <$> guardIfNeeded c <*> mapM guardIfNeeded ps
+
+-- | Inline a non-recursive function: bind the parameters to the actual values.
+inlineCall :: [Ident] -> Expr -> [Val] -> Build Val
+inlineCall ps body vals = do
+  vs <- mapM guardVal vals
+  withEnv $ do
+    forM_ (zip ps vs) $ \(p, v) -> insertB p (BVal v)
+    goExpr body
+
+-- | Run @m@ as a loop body: constants align to @tok@ (via the guard slot,
+-- whose value 1 also lets guarded calls through) and loops do not nest.
+inLoopCtx :: Port -> Build a -> Build a
+inLoopCtx tok m = do
+  s0 <- Build get
+  Build $ modify (\s -> s { bsGuard = Just tok, bsInLoop = True })
+  r <- m
+  Build $ modify (\s -> s { bsGuard = bsGuard s0, bsInLoop = bsInLoop s0 })
+  pure r
+
+-- | Raw single-input node.
+node1 :: String -> DNode -> Port -> Build Port
+node1 lbl nd p = do
+  nid <- newNode lbl nd
+  connect p (InstPort nid "0")
+  pure (out0 nid)
+
+-- | Raw two-input node.
+node2 :: String -> DNode -> Port -> Port -> Build Port
+node2 lbl nd a b = do
+  nid <- newNode lbl nd
+  connect a (InstPort nid "0")
+  connect b (InstPort nid "1")
+  pure (out0 nid)
+
+-- | Merge several producers into one port (identity addi with a source list).
+mergeP :: String -> [Port] -> Build NodeId
+mergeP lbl srcs = do
+  nid <- newNode lbl (NAddI "" 0)
+  mapM_ (\p -> connect p (InstPort nid "0")) srcs
+  pure nid
+
+-- | Steer @v@ on @c@: (true side, false side).
+steerP :: Port -> Port -> Build (Port, Port)
+steerP c v = do
+  sid <- newNode "loop_steer" (NSteer "")
+  connect c (InstPort sid "0")
+  connect v (InstPort sid "1")
+  pure (SteerPort sid "t", SteerPort sid "f")
+
+tagValP :: Port -> Build Port
+tagValP = node1 "tagval" (NTagVal "")
+
+-- | valtag: @v@ moved to the tag given by the value of @t@ (same tag/exec).
+valTagP :: Port -> Port -> Build Port
+valTagP = node2 "valtag" (NValTag "")
+
+incTagIP :: Int -> Port -> Build Port
+incTagIP k = node1 ("inctagi_" ++ show k) (NIncTagI "" k)
+
+-- | Tail recursion as a forward loop (testewhile idiom).
+tailLoop :: [Ident] -> TailShape -> [Val] -> Build Val
+tailLoop ps ts vals = do
+  argv0 <- mapM asScalar vals
+  argv1 <- mapM guardIfNeeded argv0
+  inits <- alignExecInputs argv1
+  let ref = head inits
+  entry <- tagValP ref                       -- t0, carried to restore the tag
+  -- headers: inctag [init, feedback]
+  hdrs <- mapM (\_ -> newNode "loop_inctag" (NIncTag "")) (inits ++ [entry])
+  zipWithM_ (\h p -> connect p (InstPort h "0")) hdrs (inits ++ [entry])
+  let hps     = map out0 hdrs
+      hParams = init hps
+      hEntry  = last hps
+  tokH <- constFrom (head hps) 1
+  c <- inLoopCtx tokH $ withEnv $ do
+         zipWithM_ (\p h -> insertB p (BVal (Scalar h))) ps hParams
+         goScalar (tsCond ts) >>= boolify
+  steered <- mapM (steerP c) hps
+  let (contS, exitS) = unzip [ if tsExitOnTrue ts then (f', t') else (t', f')
+                             | (t', f') <- steered ]
+  -- continue: feedback = args'
+  tokC <- constFrom (head contS) 1
+  nexts <- inLoopCtx tokC $ withEnv $ do
+             zipWithM_ (\p v -> insertB p (BVal (Scalar v))) ps (init contS)
+             mapM goScalar (tsArgs ts)
+  zipWithM_ (\h n -> connect n (InstPort h "0")) hdrs (nexts ++ [last contS])
+  -- exit: base, moved back to the entry tag
+  tokE <- constFrom (head exitS) 1
+  res <- inLoopCtx tokE $ withEnv $ do
+           zipWithM_ (\p v -> insertB p (BVal (Scalar v))) ps (init exitS)
+           goScalar (tsBase ts)
+  Scalar <$> valTagP res (last exitS)
+
+-- | List consumer over a static stream as a backward loop over the tags.
+consumerLoop :: [Ident] -> ConsShape -> [Port] -> [Val] -> Build Val
+consumerLoop ps cs xs vals = do
+  let j    = csIdx cs
+      n    = length xs
+      invI = [ i | i <- [0 .. length ps - 1], i /= j ]
+  invs0 <- mapM (\i -> asScalar (vals !! i)) invI
+  invs1 <- mapM guardIfNeeded invs0
+  xs1   <- mapM guardIfNeeded xs
+  ins   <- alignExecInputs (invs1 ++ xs1)
+  let (invs, elems0) = splitAt (length invs1) ins
+  ref <- case ins of
+           (r:_) -> pure r
+           []    -> constI 0
+  -- base at the entry tag t0
+  tok0 <- constFrom ref 1
+  baseV <- inLoopCtx tok0 $ withEnv $ do
+             zipWithM_ (\i v -> insertB (ps !! i) (BVal (Scalar v))) invI invs
+             goScalar (csBase cs)
+  baseA <- alignExecTo ref baseV
+  t0  <- tagValP ref
+  t1  <- addI t0 1                           -- tag of element 0
+  -- elements: element k at tag t0+1+k
+  elemPs <- forM (zip [0 ..] elems0) $ \(k, p) -> do
+              tk <- if k == 0 then pure t1 else addI t1 k
+              valTagP p tk
+  elemN <- if null elemPs then pure Nothing else Just <$> mergeP "loop_elem" elemPs
+  -- start values at tag t0+1+N
+  tN   <- addI t1 n
+  nP   <- constFrom ref n
+  starts <- mapM (\v -> valTagP v tN) (baseA : nP : invs)
+  hdrs <- mapM (\p -> mergeP "loop_hdr" [p]) starts
+  let hps = map out0 hdrs
+      hR  = hps !! 1
+  zR <- constFrom hR 0
+  c  <- node2 "gthan" (NGThan "") hR zR
+  steered <- mapM (steerP c) hps
+  decs <- mapM (incTagIP (-1) . fst) steered
+  let (dAcc : dR : dInvs) = decs
+  tokD <- constFrom dAcc 1
+  acc' <- inLoopCtx tokD $ withEnv $ do
+            zipWithM_ (\i v -> insertB (ps !! i) (BVal (Scalar v))) invI dInvs
+            insertB recVar (BVal (Scalar dAcc))
+            case (csHead cs, elemN) of
+              (Just h, Just en) -> insertB h (BVal (Scalar (out0 en)))
+              _                 -> pure ()
+            goScalar (csBody cs)
+  r' <- subI dR 1
+  zipWithM_ (\h p -> connect p (InstPort h "0")) hdrs (acc' : r' : dInvs)
+  -- exit (r == 0) happens at tag t0+1: move back to t0
+  Scalar <$> incTagIP (-1) (snd (head steered))
 
 -- Literais -------------------------------------------------------------
 
