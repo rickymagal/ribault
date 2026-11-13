@@ -12,7 +12,7 @@ import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Control.Monad.Except
 import Control.Monad.State
-import Control.Monad (forM, foldM, zipWithM, unless)
+import Control.Monad (forM, foldM, mapM_)
 
 -- | Desugar a single declaration.
 desugarDecl :: Decl -> Decl
@@ -63,16 +63,19 @@ data Type
   | TFun [Type] Type
   deriving (Eq, Show)
 
--- | Environment of term variables: var ↦ type.
-type TypeEnv = Map.Map Ident Type
+-- | Type schemes for let-polymorphism (forall vars . type).
+data Scheme = Forall [String] Type
 
--- | Environment of functions: name ↦ (arg types, return type).
-type FuncEnv = Map.Map Ident ([Type], Type)
+-- | Environment of variables and functions: name -> scheme.
+type TypeEnv = Map.Map Ident Scheme
 
--- | State used to generate fresh type variables.
-data InferState = InferState { count :: Int }
+-- | Substitution of type variables.
+type Subst = Map.Map String Type
 
--- | Inference monad: exceptions for 'TypeError' + fresh var state.
+-- | State: fresh-var counter plus the accumulated substitution.
+data InferState = InferState { count :: Int, subst :: Subst }
+
+-- | Inference monad: typing errors over fresh-var/substitution state.
 type Infer a = ExceptT TypeError (State InferState) a
 
 -- | Build a top-level signature (arity) from a list of declarations.
@@ -81,18 +84,6 @@ buildSig =
   foldr
     (\(FunDecl f ps _) acc -> Map.insertWith (const id) f (length ps) acc)
     Map.empty
-
--- | Create a function environment assigning fresh type variables to
--- each function's arguments and a unique return type variable @r_f@.
-buildFuncEnv :: [Decl] -> FuncEnv
-buildFuncEnv ds =
-  let userFns = map (\(FunDecl f args _) ->
-                  let tvs = replicate (length args) (TVar "_")
-                      tr  = TVar ("r_" ++ f)
-                  in (f, (tvs, tr))) ds
-      builtins = [ (f, ([TVar "_"], TVar ("r_" ++ f)))
-                  | f <- ["print","prints","printl","printf","printlf","printmf"] ]
-  in Map.fromList (builtins ++ userFns)
 
 -- | Run semantic checks (no typing) over the program and collect all errors.
 semanticCheck :: Program -> [Error]
@@ -186,193 +177,239 @@ patVars = \case
   PTuple ps -> concatMap patVars ps
   PCons p ps -> patVars p ++ patVars ps
 
--- | Run the typing pass per declaration (after desugaring) and collect errors.
+-- | Typing pass entry point: sound Hindley-Milner inference.
 checkProgram :: Program -> [Error]
 checkProgram prog =
   let Program ds = desugarProgram prog
-      fenv = buildFuncEnv ds
-  in concatMap (runDecl fenv Map.empty) ds
+      act        = inferGroup builtinEnv ds >> return ()
+  in case runState (runExceptT act) (InferState 0 Map.empty) of
+       (Left te, _) -> [TypErr te]
+       (Right _, _) -> []
+
+-- | Built-in functions, typed permissively (polymorphic argument, Int result).
+builtinEnv :: TypeEnv
+builtinEnv = Map.fromList
+  [ (f, Forall ["a"] (TFun [TVar "a"] TInt))
+  | f <- ["print","prints","printl","printf","printlf","printmf"] ]
+
+freshTV :: Infer Type
+freshTV = do
+  s <- get
+  let n = count s + 1
+  put s { count = n }
+  return (TVar ("t" ++ show n))
+
+applyT :: Subst -> Type -> Type
+applyT s t = case t of
+  TVar a    -> Map.findWithDefault t a s
+  TList e   -> TList (applyT s e)
+  TTuple es -> TTuple (map (applyT s) es)
+  TFun as r -> TFun (map (applyT s) as) (applyT s r)
+  _         -> t
+
+composeS :: Subst -> Subst -> Subst
+composeS s1 s2 = Map.union (Map.map (applyT s1) s2) s1
+
+ftv :: Type -> [String]
+ftv t = case t of
+  TVar a    -> [a]
+  TList e   -> ftv e
+  TTuple es -> concatMap ftv es
+  TFun as r -> concatMap ftv as ++ ftv r
+  _         -> []
+
+ftvScheme :: Scheme -> [String]
+ftvScheme (Forall vs t) = filter (`notElem` vs) (ftv t)
+
+ftvEnv :: TypeEnv -> [String]
+ftvEnv env = concatMap ftvScheme (Map.elems env)
+
+extendSubst :: Subst -> Infer ()
+extendSubst u = modify (\st -> st { subst = composeS u (subst st) })
+
+unify :: Type -> Type -> Infer ()
+unify a b = do
+  s <- gets subst
+  u <- mgu (applyT s a) (applyT s b)
+  extendSubst u
+
+mgu :: Type -> Type -> Infer Subst
+mgu a b = case (a, b) of
+  (TVar x, t)        -> bindVar x t
+  (t, TVar x)        -> bindVar x t
+  (TInt, TInt)       -> return Map.empty
+  (TFloat, TFloat)   -> return Map.empty
+  (TBool, TBool)     -> return Map.empty
+  (TChar, TChar)     -> return Map.empty
+  (TString, TString) -> return Map.empty
+  (TList x, TList y) -> mgu x y
+  (TTuple xs, TTuple ys)
+    | length xs == length ys -> mguList xs ys
+  (TFun xs rx, TFun ys ry)
+    | length xs == length ys -> do
+        s1 <- mguList xs ys
+        s2 <- mgu (applyT s1 rx) (applyT s1 ry)
+        return (composeS s2 s1)
+  _ -> throwError (Mismatch (Var "<unify>") a b)
+
+mguList :: [Type] -> [Type] -> Infer Subst
+mguList [] [] = return Map.empty
+mguList (x:xs) (y:ys) = do
+  s1 <- mgu x y
+  s2 <- mguList (map (applyT s1) xs) (map (applyT s1) ys)
+  return (composeS s2 s1)
+mguList _ _ = throwError (Mismatch (Var "<arity>") TInt TInt)
+
+bindVar :: String -> Type -> Infer Subst
+bindVar x t
+  | t == TVar x    = return Map.empty
+  | x `elem` ftv t = throwError (Mismatch (Var ("occurs " ++ x)) (TVar x) t)
+  | otherwise      = return (Map.singleton x t)
+
+instantiate :: Scheme -> Infer Type
+instantiate (Forall vs t) = do
+  vs' <- mapM (const freshTV) vs
+  return (applyT (Map.fromList (zip vs vs')) t)
+
+generalize :: TypeEnv -> Type -> Infer Scheme
+generalize env t = do
+  s <- gets subst
+  let t'  = applyT s t
+      evs = ftvEnv (Map.map (applySchemeS s) env)
+      vs  = filter (`notElem` evs) (dedup (ftv t'))
+  return (Forall vs t')
   where
-    runDecl fenv tenv (FunDecl f ps b) =
-      let argTys = replicate (length ps) (TVar "_")
-          retTy  = TVar ("r_" ++ f)
-          env'   = Map.union (Map.fromList (zip ps argTys)) tenv
-          act    = inferExpr fenv env' b >>= unifyReturn retTy
-          st0    = InferState 0
-      in case runState (runExceptT act) st0 of
-           (Left te, _) -> [TypErr te]
-           _            -> []
+    applySchemeS sb (Forall qs ty) = Forall qs (applyT (foldr Map.delete sb qs) ty)
+    dedup = foldr (\x acc -> if x `elem` acc then acc else x : acc) []
 
--- | Unify two (return) types, preferring concrete types when possible.
-unifyReturn :: Type -> Type -> Infer Type
-unifyReturn expected actual
-  | TVar _    <- expected          = return actual
-  | TVar _    <- actual            = return expected
-  | expected == actual             = return actual
-  | TList e  <- expected
-  , TList a  <- actual             = unifyReturn e a >> return actual
-  | TTuple es <- expected
-  , TTuple as <- actual
-  , length es == length as         = mapM_ (uncurry unifyReturn) (zip es as) >> return actual
-  | TFun ps r <- expected
-  , TFun qs s <- actual
-  , length ps == length qs         = mapM_ (uncurry unifyReturn) (zip ps qs) >> unifyReturn r s
-  | otherwise                      = throwError (Mismatch (Var "<return>") expected actual)
-
-isTVar :: Type -> Bool
-isTVar (TVar _) = True
-isTVar _        = False
-
--- | Infer the type of an expression under function and term environments.
-inferExpr :: FuncEnv -> TypeEnv -> Expr -> Infer Type
-inferExpr fenv tenv expr = case expr of
-  Var x -> case Map.lookup x tenv of
-             Just t  -> return t
-             Nothing -> case Map.lookup x fenv of
-               Just ([], retT)     -> return retT
-               Just (argTys, retT) -> return (TFun argTys retT)
-               Nothing             -> throwError (UnknownVar x)
-  Lit l -> return $ literalType l
-  Cons hd tl -> do
-    tHd <- inferExpr fenv tenv hd
-    tTl <- inferExpr fenv tenv tl
-    case tTl of
-      TList tEl | match tHd tEl -> return (TList (resolve tHd tEl))
-      TVar _ -> return (TList tHd)
-      _ -> throwError (Mismatch expr (TList tHd) tTl)
-  Lambda ps bd -> do
-    tys <- mapM (const freshTypeVar) ps
-    let tenv' = Map.union (Map.fromList (zip ps tys)) tenv
-    tr <- inferExpr fenv tenv' bd
-    return (TFun tys tr)
-  If c t e -> do
-    _  <- inferExpr fenv tenv c >>= ensureBool c
-    tc <- inferExpr fenv tenv t
-    te <- inferExpr fenv tenv e
-    unifyReturn tc te
-  Case scr alts -> do
-    scrT <- inferExpr fenv tenv scr
-    rs   <- forM alts $ \(pat, bd') -> do
-      (vs,pT) <- inferPattern pat
-      _ <- unifyReturn scrT pT
-      inferExpr fenv (Map.union (Map.fromList vs) tenv) bd'
-    case rs of
-      (r0:rs') -> foldM unifyReturn r0 rs'
-      []       -> throwError (Mismatch scr scrT scrT)
-  Let ds e -> do
-    let fenv' = Map.union (buildFuncEnv ds) fenv
-    tenv' <- foldM
-               (\envAcc d -> case d of
-                  FunDecl fn [] bd' -> do
-                    t <- inferExpr fenv' envAcc bd'
-                    return (Map.insert fn t envAcc)
-                  _ -> return envAcc
-               )
-               tenv
-               ds
-    inferExpr fenv' tenv' e
+infer :: TypeEnv -> Expr -> Infer Type
+infer env expr = case expr of
+  Lit l  -> return (literalType l)
+  Var x  -> case Map.lookup x env of
+              Just sc -> instantiate sc
+              Nothing -> throwError (UnknownVar x)
+  Lambda ps b -> do
+    tvs <- mapM (const freshTV) ps
+    let env' = foldr (\(p,tv) m -> Map.insert p (Forall [] tv) m) env (zip ps tvs)
+    tb <- infer env' b
+    s  <- gets subst
+    return (applyT s (TFun tvs tb))
   App{} -> do
-    -- Aplicação relaxada: inferimos função e argumentos,
-    -- mas não geramos mais erro por quantidade/tipo de argumentos.
-    let (fn0,args) = flattenApp expr
-    fty   <- inferExpr fenv tenv fn0
-    _     <- mapM (inferExpr fenv tenv) args
-    case fty of
-      TFun _ r -> return r
-      TVar _   -> freshTypeVar
-      _        -> freshTypeVar
+    let (fn, args) = flattenApp expr
+    tf  <- infer env fn
+    tas <- mapM (infer env) args
+    tr  <- freshTV
+    unify tf (TFun tas tr)
+    s   <- gets subst
+    return (applyT s tr)
+  If c t e -> do
+    tc0 <- infer env c
+    unify tc0 TBool
+    tt <- infer env t
+    te <- infer env e
+    unify tt te
+    s  <- gets subst
+    return (applyT s tt)
   BinOp op l r -> do
-    tl <- inferExpr fenv tenv l
-    tr <- inferExpr fenv tenv r
-    case op of
-      Add -> numBin  op tl tr
-      Sub -> numBin  op tl tr
-      Mul -> numBin  op tl tr
-      Div -> numBin  op tl tr
-      Mod -> numBin  op tl tr
-      Eq  -> compBin op tl tr
-      Neq -> compBin op tl tr
-      Lt  -> compBin op tl tr
-      Le  -> compBin op tl tr
-      Gt  -> compBin op tl tr
-      Ge  -> compBin op tl tr
-      And -> boolBin op tl tr
-      Or  -> boolBin op tl tr
-  UnOp op e -> do
-    te <- inferExpr fenv tenv e
-    case op of
-      Neg | te `elem` [TInt,TFloat] -> return te
-          | isPoly te               -> freshTypeVar
-          | otherwise               -> throwError (UnOpTypeErr op te)
-      Not | te == TBool             -> return TBool
-          | isPoly te               -> return TBool
-          | otherwise               -> throwError (UnOpTypeErr op te)
+    tl <- infer env l
+    tr <- infer env r
+    inferBin op tl tr
+  UnOp op x -> do
+    tx <- infer env x
+    inferUn op tx
+  Cons h t -> do
+    th <- infer env h
+    tt <- infer env t
+    unify tt (TList th)
+    s  <- gets subst
+    return (applyT s (TList th))
   List xs -> do
-    ts    <- mapM (inferExpr fenv tenv) xs
-    eltTy <- case ts of
-               []      -> freshTypeVar
-               (t:ts') -> foldM (unifyTypes expr) t ts'
-    return (TList eltTy)
-  Tuple xs -> TTuple <$> mapM (inferExpr fenv tenv) xs
-  Super _ inputs _ ->
-    -- First element is function name; look up first actual arg for type
-    case drop 1 inputs of
-      (inId:_) -> case Map.lookup inId tenv of
-                    Just t  -> return t
-                    Nothing -> freshTypeVar
-      []       -> freshTypeVar
-  where
-    unifyTypes :: Expr -> Type -> Type -> Infer Type
-    unifyTypes e t1 t2 = case (t1,t2) of
-      (TVar _, t)            -> return t
-      (t, TVar _)            -> return t
-      (TList a, TList b)     -> TList <$> unifyTypes e a b
-      (TTuple as, TTuple bs)
-        | length as == length bs -> TTuple <$> zipWithM (unifyTypes e) as bs
-      _ | t1 == t2           -> return t1
-      _                      -> throwError (Mismatch e t1 t2)
+    te <- freshTV
+    mapM_ (\x -> infer env x >>= unify te) xs
+    s  <- gets subst
+    return (applyT s (TList te))
+  Tuple xs -> do
+    ts <- mapM (infer env) xs
+    s  <- gets subst
+    return (applyT s (TTuple ts))
+  Case scr alts -> do
+    tscr <- infer env scr
+    tr   <- freshTV
+    mapM_ (\(pat, bd) -> do
+             (bs, tp) <- inferPat pat
+             unify tscr tp
+             let env' = foldr (\(v,t) m -> Map.insert v (Forall [] t) m) env bs
+             tb <- infer env' bd
+             unify tr tb) alts
+    s <- gets subst
+    return (applyT s tr)
+  Let ds b -> do
+    env' <- inferGroup env ds
+    infer env' b
+  Super _ _ _ -> freshTV
 
--- | Type compatibility treating 'TVar' as wildcard.
-match :: Type -> Type -> Bool
-match (TVar _) _ = True
-match _ (TVar _) = True
-match a b        = a == b
+-- | Infer a (mutually recursive) declaration group; return env + generalized schemes.
+inferGroup :: TypeEnv -> [Decl] -> Infer TypeEnv
+inferGroup env ds = do
+  rows <- forM ds $ \(FunDecl f ps body) -> do
+    ptvs <- mapM (const freshTV) ps
+    rtv  <- freshTV
+    let fty = if null ps then rtv else TFun ptvs rtv
+    return (f, ps, body, ptvs, rtv, fty)
+  let envRec = foldr (\(f,_,_,_,_,fty) m -> Map.insert f (Forall [] fty) m) env rows
+  mapM_ (\(_, ps, body, ptvs, rtv, _) -> do
+           let envB = foldr (\(p,tv) m -> Map.insert p (Forall [] tv) m) envRec (zip ps ptvs)
+           tb <- infer envB body
+           unify tb rtv) rows
+  foldM (\m (f,_,_,_,_,fty) -> do
+           sc <- generalize env fty
+           return (Map.insert f sc m)) env rows
 
--- | Resolve two compatible types, preferring non-'TVar' when available.
-resolve :: Type -> Type -> Type
-resolve (TVar _) t = t
-resolve t       _  = t
-
--- | Infer a pattern, returning (bound variables with types, pattern type).
-inferPattern :: Pattern -> Infer ([(Ident,Type)],Type)
-inferPattern = \case
-  PVar x    -> do tv <- freshTypeVar; return ([(x,tv)],tv)
-  PWildcard -> return ([], TVar "_")
-  PLit l    -> return ([], literalType l)
-  PList ps  -> do
-    xs <- mapM inferPattern ps
-    let (vs,ts) = unzip xs
-    let unify acc t =
-          if match acc t
-            then return (resolve acc t)
-            else throwError
-                   (Mismatch (Lit (LString "pattern"))
-                             (TList acc)
-                             (TList t))
-    elemTy <- case ts of
-                []      -> freshTypeVar
-                (t:ts') -> foldM unify t ts'
-    return (concat vs, TList elemTy)
-  PTuple ps -> do
-    xs <- mapM inferPattern ps
-    let (vs,ts) = unzip xs
-    return (concat vs, TTuple ts)
+inferPat :: Pattern -> Infer ([(Ident,Type)], Type)
+inferPat = \case
+  PWildcard  -> do tv <- freshTV; return ([], tv)
+  PVar x     -> do tv <- freshTV; return ([(x,tv)], tv)
+  PLit l     -> return ([], literalType l)
+  PList ps   -> do
+    rs <- mapM inferPat ps
+    te <- freshTV
+    mapM_ (unify te . snd) rs
+    return (concatMap fst rs, TList te)
+  PTuple ps  -> do
+    rs <- mapM inferPat ps
+    return (concatMap fst rs, TTuple (map snd rs))
   PCons p ps -> do
-    (v1, t1) <- inferPattern p
-    (v2, t2) <- inferPattern ps
-    unless (match t2 (TList t1) || isPoly t1 || isPoly t2)
-      $ throwError (Mismatch (Lit (LString "pattern")) (TList t1) t2)
+    (v1, t1) <- inferPat p
+    (v2, t2) <- inferPat ps
+    unify t2 (TList t1)
     return (v1 ++ v2, TList t1)
+
+-- | Arithmetic unifies operands (matches tc on the integer core); comparisons
+-- return Bool over equal operands; logical operators require Bool.
+inferBin :: BinOperator -> Type -> Type -> Infer Type
+inferBin op tl tr = case op of
+  Add -> arith
+  Sub -> arith
+  Mul -> arith
+  Div -> arith
+  Mod -> arith
+  Eq  -> comp
+  Neq -> comp
+  Lt  -> comp
+  Le  -> comp
+  Gt  -> comp
+  Ge  -> comp
+  And -> logic
+  Or  -> logic
+  where
+    arith = do unify tl tr; s <- gets subst; return (applyT s tl)
+    comp  = do unify tl tr; return TBool
+    logic = do unify tl TBool; unify tr TBool; return TBool
+
+inferUn :: UnOperator -> Type -> Infer Type
+inferUn op tx = case op of
+  Neg -> return tx
+  Not -> do unify tx TBool; return TBool
 
 literalType :: Literal -> Type
 literalType = \case
@@ -382,41 +419,7 @@ literalType = \case
   LChar _   -> TChar
   LString _ -> TString
 
-numBin, boolBin, compBin :: BinOperator -> Type -> Type -> Infer Type
-numBin _ TInt   TInt   = return TInt
-numBin _ TFloat TFloat = return TFloat
-numBin _ (TVar _) t | t `elem` [TInt,TFloat] = return t
-numBin _ t (TVar _) | t `elem` [TInt,TFloat] = return t
-numBin _ (TVar _) (TVar _) = freshTypeVar
-numBin op a b = throwError (BinOpTypeErr op a b)
-
-boolBin _ TBool TBool = return TBool
-boolBin _ (TVar _) _  = return TBool
-boolBin _ _ (TVar _)  = return TBool
-boolBin op a b        = throwError (BinOpTypeErr op a b)
-
-compBin _ a b
-  | a==b && a `elem` [TInt,TFloat,TChar,TString] = return TBool
-compBin _ (TVar _) _ = return TBool
-compBin _ _ (TVar _) = return TBool
-compBin op a b       = throwError (BinOpTypeErr op a b)
-
-ensureBool :: Expr -> Type -> Infer ()
-ensureBool _ TBool    = return ()
-ensureBool _ (TVar _) = return ()
-ensureBool e t        = throwError (CondNotBool e t)
-
-freshTypeVar :: Infer Type
-freshTypeVar = do
-  s <- get
-  let n = count s + 1
-  put s { count = n }
-  return (TVar ("t" ++ show n))
-
-isPoly :: Type -> Bool
-isPoly (TVar _) = True
-isPoly _        = False
-
+-- | Full analysis: semantic (scope/arity/dup) + sound typing.
 checkAll :: Program -> [Error]
 checkAll p = semanticCheck p ++ checkProgram p
 
