@@ -25,10 +25,10 @@ module Synthesis.Builder
   ) where
 
 import           Prelude hiding (lookup)
-import           Control.Monad          (forM, forM_, zipWithM_, when)
+import           Control.Monad          (forM, forM_, zipWithM_, when, foldM)
 import           Control.Monad.State    (StateT, get, put, runStateT, gets, modify)
 import           Control.Monad.Trans    (lift)
-import           Data.Maybe             (listToMaybe)
+import           Data.Maybe             (listToMaybe, catMaybes)
 import           GHC.Float              (castFloatToWord32)
 import qualified Data.Map              as M
 import qualified Data.Set              as S
@@ -47,8 +47,16 @@ type DFG = DGraph DNode
 
 -- Ambiente
 
--- | Builder-time binding: either a realized 'Port' or a lambda to be built.
-data Binding = BPort Port | BLam [Ident] Expr
+-- | Synthesized value of an expression.
+--
+-- * 'Scalar': a single port (scalars, and lists/tuples in the legacy
+--   pair encoding built by the list supers).
+-- * 'Stream': a statically sized, length-prefixed stream: the count port
+--   (an int node) plus one payload port per position @0..N-1@.
+data Val = Scalar Port | Stream Port [Port]
+
+-- | Builder-time binding: either a realized 'Val' or a lambda to be built.
+data Binding = BVal Val | BLam [Ident] Expr
 
 -- | A single-scope environment mapping identifiers to 'Binding'.
 type Env = M.Map Ident Binding
@@ -653,6 +661,85 @@ foldrM' f z0 = go
     go (y:ys) = do r <- go ys
                    f y r
 
+-- streams estáticos ------------------------------------------------------
+
+-- | Re-encode a value in the legacy pair encoding (list boundary).
+streamToPair :: Val -> Build Port
+streamToPair = \case
+  Scalar p      -> pure p
+  Stream _ []   -> nilP
+  Stream _ ps   -> do z <- nilP; foldrM' pairEnc z ps
+
+-- | Use a value in scalar context; streams are re-encoded via 'streamToPair'.
+asScalar :: Val -> Build Port
+asScalar = streamToPair
+
+-- | Synthesize an expression and use it in scalar context.
+goScalar :: Expr -> Build Port
+goScalar e = goExpr e >>= asScalar
+
+-- | Static outcome of matching a pattern against a value of known shape.
+data StaticMatch = SMNo | SMYes | SMDyn
+  deriving (Eq)
+
+-- | Shape of a value as far as static matching is concerned.
+data Shape = SScalar | SStream Int
+
+-- | Classify a pattern against a shape without emitting nodes.
+staticMatch :: Pattern -> Shape -> StaticMatch
+staticMatch pat sh = case (pat, sh) of
+  (PWildcard, _)          -> SMYes
+  (PVar _, _)             -> SMYes
+  (_, SScalar)            -> SMDyn
+  (PList ps, SStream n)   -> seqM n ps
+  (PTuple ps, SStream n)  -> seqM n ps
+  (PCons ph pt, SStream n)
+    | n == 0              -> SMNo
+    | otherwise           -> both [staticMatch ph SScalar, staticMatch pt (SStream (n - 1))]
+  (PLit _, SStream _)     -> SMNo
+  where
+    seqM n ps
+      | length ps /= n = SMNo
+      | otherwise      = both [ staticMatch q SScalar | q <- ps ]
+    both ms
+      | SMNo `elem` ms  = SMNo
+      | SMDyn `elem` ms = SMDyn
+      | otherwise       = SMYes
+
+-- | Shape of a value.
+shapeOf :: Val -> Shape
+shapeOf = \case
+  Scalar _    -> SScalar
+  Stream _ ps -> SStream (length ps)
+
+-- | Build the bindings (and runtime predicate, if any) for a pattern that
+-- 'staticMatch' did not reject. @Nothing@ means statically true.
+matchVal :: Val -> Pattern -> Build (Maybe Port, [(Ident, Val)])
+matchVal v pat = case (pat, v) of
+  (PWildcard, _) -> pure (Nothing, [])
+  (PVar x, _)    -> pure (Nothing, [(x, v)])
+  (_, Scalar p)  -> do
+    (pp, bs) <- patPred p pat
+    pure (Just pp, [ (x, Scalar q) | (x, q) <- bs ])
+  (PList ps, Stream _ xs)  -> allOf (zipWith (\q x -> matchVal (Scalar x) q) ps xs)
+  (PTuple ps, Stream _ xs) -> allOf (zipWith (\q x -> matchVal (Scalar x) q) ps xs)
+  (PCons ph pt, Stream c (x:xs)) -> do
+    rh <- matchVal (Scalar x) ph
+    rt <- case pt of
+            PWildcard -> pure (Nothing, [])
+            _         -> do c' <- subI c 1
+                            matchVal (Stream c' xs) pt
+    allOf [pure rh, pure rt]
+  _ -> do f <- falseP; pure (Just f, [])
+  where
+    allOf ms = do
+      rs <- sequence ms
+      let preds = catMaybes (map fst rs)
+          bs    = concatMap snd rs
+      case preds of
+        []     -> pure (Nothing, bs)
+        (q:qs) -> do g <- foldM andP q qs; pure (Just g, bs)
+
 -- API ------------------------------------------------------------------
 
 -- | Count calls per callee in an expression, returning a map callee→count.
@@ -737,8 +824,10 @@ buildProgram p0 =
     buildZero (FunDecl f ps body) | null ps = do
       when (exprHasList body) (markListFun f)
       when (exprHasFloat body) (markFloatFun f)
-      p <- withActive f (withEnv (goExpr body))
-      insertB f (BPort p)
+      (v, p) <- withActive f (withEnv (do v <- goExpr body
+                                          p <- asScalar v
+                                          pure (v, p)))
+      insertB f (BVal v)
       r <- retNodeId f
       setRetVal f p
       connectPlus p (InstPort r "0")
@@ -788,8 +877,8 @@ ensureBuilt f ps body = do
               forM_ (zip [0..] ps) $ \(i, v) -> do
                 let slot = i + 1
                 a <- argNode f slot
-                insertB v (BPort a)
-              res <- goExpr body
+                insertB v (BVal (Scalar a))
+              res <- goScalar body
               _ <- retNodeId f
               connectPlus res (InstPort retStub "0")
        pure ()
@@ -801,7 +890,7 @@ freeVar :: Ident -> Build Port
 freeVar x = do
   nid <- newNode x (NArg x)
   let p = out0 nid
-  insertB x (BPort p)
+  insertB x (BVal (Scalar p))
   pure p
 
 -- detecta se um Port carrega float (por origem)
@@ -872,39 +961,39 @@ isFloatContext a b = do
 
 -- Expressões -----------------------------------------------------------
 
--- | Synthesize an expression into the graph and return its output 'Port'.
-goExpr :: Expr -> Build Port
+-- | Synthesize an expression into the graph and return its 'Val'.
+goExpr :: Expr -> Build Val
 goExpr = \case
   Var x -> do
     lookupB x >>= \case
-      Just (BPort p) -> pure p
+      Just (BVal v) -> pure v
       Just (BLam ps body) ->
         if null ps
-          then do p <- withEnv (goExpr body)
-                  updateB x (BPort p)
-                  pure p
-          else freeVar x
-      Nothing -> freeVar x
+          then do v <- withEnv (goExpr body)
+                  updateB x (BVal v)
+                  pure v
+          else Scalar <$> freeVar x
+      Nothing -> Scalar <$> freeVar x
 
-  Lit lit -> litNode lit
+  Lit lit -> Scalar <$> litNode lit
 
   Lambda ps e ->
     withEnv $ do
-      mapM_ (\v -> insertB v (BPort (InstPort (-1) v))) ps
+      mapM_ (\v -> insertB v (BVal (Scalar (InstPort (-1) v)))) ps
       goExpr e
 
   If c t e -> do
-    pc0 <- goExpr c
+    pc0 <- goScalar c
     pc <- boolify pc0
     pcTok <- guardToken pc
     baseK <- Build $ gets bsScopeK
-    vt0 <- withEnv (withGuard pc (goExpr t))
+    vt0 <- withEnv (withGuard pc (goScalar t))
     vt <- alignExecTo pcTok vt0
     kAfterT <- Build $ gets bsScopeK
     Build $ modify (\s -> s { bsScopeK = baseK })
     npc <- notP pc
     npcTok <- guardToken npc
-    ve0 <- withEnv (withGuard npc (goExpr e))
+    ve0 <- withEnv (withGuard npc (goScalar e))
     ve <- alignExecTo npcTok ve0
     kAfterE <- Build $ gets bsScopeK
     Build $ modify (\s -> s { bsScopeK = max kAfterT kAfterE })
@@ -919,14 +1008,17 @@ goExpr = \case
     let outF = SteerPort stF "t"
 
     registerAlias outT [outF]
-    pure outT
+    pure (Scalar outT)
 
-  -- listas / tuplas
-  Cons a b     -> do pa <- goExpr a; pb <- goExpr b; pairEnc pa pb
-  List xs      -> do z <- nilP; es <- mapM goExpr xs; foldrM' pairEnc z es
-  Tuple [a,b]  -> do pa <- goExpr a; pb <- goExpr b; pairEnc pa pb
-  Tuple (a:_)  -> goExpr a
-  Tuple []     -> constI 0
+  -- listas / tuplas: stream estático nativo (length-prefix)
+  Cons a b -> do
+    pa <- goScalar a
+    vb <- goExpr b
+    case vb of
+      Stream c ps -> do c' <- addI c 1; pure (Stream c' (pa : ps))
+      Scalar pb   -> Scalar <$> pairEnc pa pb
+  List xs  -> staticStream xs
+  Tuple xs -> staticStream xs
 
   Case scr alts -> compileCase scr alts
 
@@ -935,10 +1027,10 @@ goExpr = \case
   App f x -> let (g,args) = flattenApp (App f x) in goApp g args
 
   BinOp op l r -> do
-    pl <- goExpr l
-    pr <- goExpr r
+    pl <- goScalar l
+    pr <- goScalar r
     fctx <- isFloatContext pl pr
-    case op of
+    Scalar <$> case op of
       Add | fctx      -> bin2 "fadd" (NFAdd "")  pl pr
           | otherwise -> bin2 "add"  (NAdd  "")  pl pr
       Sub | fctx      -> do ny <- fmulI pr (-1.0)     -- fsub = fadd(x, y*-1)
@@ -968,14 +1060,14 @@ goExpr = \case
                 notP eq
 
   UnOp u e -> do
-    pe <- goExpr e
-    case u of
+    pe <- goScalar e
+    Scalar <$> case u of
       Neg -> do z <- constI 0; bin2 "sub" (NSub "") z pe
       Not -> notP pe
 
   Super nm inputs _ -> do
     let args = if length inputs > 1 then tail inputs else inputs
-    pIns <- mapM (\v -> goExpr (Var v)) args
+    pIns <- mapM (\v -> goScalar (Var v)) args
     nid <- naryNode nm NSuper
              { nName     = ""
              , superNum  = superNumFromName nm
@@ -983,7 +1075,14 @@ goExpr = \case
              , superSpec = False
              , superImm  = Nothing
              } pIns
-    pure (out0 nid)
+    pure (Scalar (out0 nid))
+
+-- | Static-length stream: count = N, payloads = element ports.
+staticStream :: [Expr] -> Build Val
+staticStream xs = do
+  ps <- mapM goScalar xs
+  c  <- constI (length ps)
+  pure (Stream c ps)
 
 -- Declarações ----------------------------------------------------------
 
@@ -1048,13 +1147,13 @@ bindFormal :: String -> Int -> Ident -> Port -> Build ()
 bindFormal fun i formal actual = do
   let slot = i + 1
   ap <- argNode fun slot
-  insertB formal (BPort ap)
+  insertB formal (BVal (Scalar ap))
   case ap of
     InstPort nid _ -> connectPlus actual (InstPort nid "0")
     _              -> pure ()
 
 -- | Apply a function or lambda to argument expressions.
-goApp :: Expr -> [Expr] -> Build Port
+goApp :: Expr -> [Expr] -> Build Val
 goApp fun args = case fun of
   -- Built-in print variants (C-style):
   --   print x    → integer       prints xs   → string (ASCII list)
@@ -1062,7 +1161,7 @@ goApp fun args = case fun of
   --   printlf xs → list of float printmf xs  → matrix of floats
   Var p | p `elem` ["print","prints","printl","printf","printlf","printmf"]
         , length args == 1 -> do
-    pArg <- goExpr (head args)
+    pArg <- goScalar (head args)
     let sn = case p of
                "print"   -> builtinPrint
                "prints"  -> builtinPrintStr
@@ -1071,10 +1170,10 @@ goApp fun args = case fun of
                "printlf" -> builtinPrintFloatList
                "printmf" -> builtinPrintFloatMatrix
                _         -> builtinPrint
-    callBuiltinSuper sn [pArg]
+    Scalar <$> callBuiltinSuper sn [pArg]
 
   Var f -> do
-    argv0 <- mapM goExpr args
+    argv0 <- mapM goScalar args
     argv1 <- mapM guardIfNeeded argv0
     argv <- alignExecInputs argv1
     anyFloat <- or <$> mapM portIsFloat argv
@@ -1132,12 +1231,12 @@ goApp fun args = case fun of
         z <- constFrom rsTag 0
         connectPlus z (InstPort retN "0")
         mkParentTag isTree stride z
-    pure resOut
+    pure (Scalar resOut)
 
   Lambda ps body -> do
     let fname = "lambda"
         tid   = funTaskId fname
-    argv0 <- mapM goExpr args
+    argv0 <- mapM goScalar args
     argv1 <- mapM guardIfNeeded argv0
     argv <- alignExecInputs argv1
     cg <- newNode fname (NCallGroup fname)
@@ -1161,7 +1260,7 @@ goApp fun args = case fun of
   _ -> do
     _ <- mapM goExpr args
     case args of
-      [] -> constI 0
+      [] -> Scalar <$> constI 0
       _  -> goExpr (last args)
 
 -- Literais -------------------------------------------------------------
@@ -1239,33 +1338,63 @@ falseP = constI 0
 -- CASE / Pattern matching ----------------------------------------------
 
 -- | Compile a @case@ by building guards and steering results.
-compileCase :: Expr -> [(Pattern, Expr)] -> Build Port
+compileCase :: Expr -> [(Pattern, Expr)] -> Build Val
 compileCase scr alts = do
-  pscr <- goExpr scr
-  case alts of
-    [(p,e)] | patAlwaysTrue p -> do
-      (_pp, binds) <- patPred pscr p
-      withEnv $ do
-        mapM_ (\(x,v) -> insertB x (BPort v)) binds
-        goExpr e
-    _ -> do
-      taken0 <- constFrom pscr 0
-      baseK <- Build $ gets bsScopeK
-      outs <- goAlts pscr taken0 alts [] baseK
-      case outs of
-        []       -> falseP
-        (h:rest) -> registerAlias h rest >> pure h
+  vscr <- goExpr scr
+  case vscr of
+    Scalar pscr -> case alts of
+      [(p,e)] | patAlwaysTrue p -> do
+        (_pp, binds) <- patPred pscr p
+        withEnv $ do
+          mapM_ (\(x,v) -> insertB x (BVal (Scalar v))) binds
+          goExpr e
+      _ -> do
+        taken0 <- constFrom pscr 0
+        let alts' = [ (scalarPred pscr p, e) | (p, e) <- alts ]
+        steerAlts taken0 alts'
+    Stream c _ -> do
+      -- Count is static: drop alternatives that cannot match and stop at
+      -- the first one that always matches.
+      let classified = [ (p, e, staticMatch p (shapeOf vscr)) | (p, e) <- alts ]
+          live       = cutAtYes [ a | a@(_, _, m) <- classified, m /= SMNo ]
+      case live of
+        [] -> Scalar <$> falseP
+        ((p, e, SMYes):_) -> do
+          (_, binds) <- matchVal vscr p
+          withEnv $ do
+            mapM_ (\(x,v) -> insertB x (BVal v)) binds
+            goExpr e
+        _ -> do
+          taken0 <- constFrom c 0
+          let alts' = [ (streamPred c vscr p, e) | (p, e, _) <- live ]
+          steerAlts taken0 alts'
   where
     patAlwaysTrue = \case
       PVar{}      -> True
       PWildcard   -> True
-      PTuple [_,_] -> True
+      PTuple _    -> True
       _           -> False
+    cutAtYes [] = []
+    cutAtYes (a@(_, _, SMYes):_) = [a]
+    cutAtYes (a:as) = a : cutAtYes as
+    scalarPred pscr p = do
+      (pp, bs) <- patPred pscr p
+      pure (pp, [ (x, Scalar q) | (x, q) <- bs ])
+    streamPred c v p = do
+      (mp, bs) <- matchVal v p
+      pp <- maybe (constFrom c 1) pure mp
+      pure (pp, bs)
+    steerAlts taken0 alts' = do
+      baseK <- Build $ gets bsScopeK
+      outs <- goAlts taken0 alts' [] baseK
+      case outs of
+        []       -> Scalar <$> falseP
+        (h:rest) -> registerAlias h rest >> pure (Scalar h)
     -- Última alternativa: NÃO compute orP/taken' (evita nó morto).
-    goAlts _    _     []              acc _maxK = pure (reverse acc)
-    goAlts pscr taken [(p,e)]         acc _maxK = do
+    goAlts _     []              acc _maxK = pure (reverse acc)
+    goAlts taken [(mkPred,e)]    acc _maxK = do
       (pPred, binds, guardi) <- withNoGuard $ do
-        (pp0, bs) <- patPred pscr p
+        (pp0, bs) <- mkPred
         pp <- boolify pp0
         pp' <- alignExecTo taken pp
         nt  <- notP taken
@@ -1274,8 +1403,8 @@ compileCase scr alts = do
         pure (pp', bs, g)
       baseK <- Build $ gets bsScopeK
       val0 <- withEnv $ withGuard guardi $ do
-               mapM_ (\(x,v) -> insertB x (BPort v)) binds
-               goExpr e
+               mapM_ (\(x,v) -> insertB x (BVal v)) binds
+               goScalar e
       val <- alignExecTo guardi val0
       kAfter <- Build $ gets bsScopeK
       Build $ modify (\s -> s { bsScopeK = max (max _maxK kAfter) baseK })
@@ -1287,9 +1416,9 @@ compileCase scr alts = do
       pure (reverse (out:acc))
 
     -- Alternativas intermediárias: mantém o cálculo de taken'
-    goAlts pscr taken ((p,e):rs)     acc maxK0 = do
+    goAlts taken ((mkPred,e):rs) acc maxK0 = do
       (pPred, binds, guardi, taken') <- withNoGuard $ do
-        (pp0, bs) <- patPred pscr p
+        (pp0, bs) <- mkPred
         pp <- boolify pp0
         pp' <- alignExecTo taken pp
         nt  <- notP taken
@@ -1299,8 +1428,8 @@ compileCase scr alts = do
         pure (pp', bs, g, tk)
       baseK <- Build $ gets bsScopeK
       val0 <- withEnv $ withGuard guardi $ do
-               mapM_ (\(x,v) -> insertB x (BPort v)) binds
-               goExpr e
+               mapM_ (\(x,v) -> insertB x (BVal v)) binds
+               goScalar e
       val <- alignExecTo guardi val0
       kAfter <- Build $ gets bsScopeK
       Build $ modify (\s -> s { bsScopeK = baseK })
@@ -1309,14 +1438,28 @@ compileCase scr alts = do
       connect tok (InstPort sid "0")
       connect val (InstPort sid "1")
       let out = SteerPort sid "t"
-      goAlts pscr taken' rs (out:acc) (max maxK0 kAfter)
+      goAlts taken' rs (out:acc) (max maxK0 kAfter)
 
 -- | Build the predicate and bindings for matching a 'Pattern' against a scrutinee port.
 patPred :: Port -> Pattern -> Build (Port, [(Ident, Port)])
 patPred scr = \case
-  PTuple [p1,p2] -> do
-    a <- fstDec scr; b <- sndDec scr; t <- constFrom scr 1
-    pure (t, bindIfVar p1 a ++ bindIfVar p2 b)
+  -- Tuples share the list encoding: component i = head (tail^i scr).
+  PTuple ps -> do
+    t <- constFrom scr 1
+    let go _   []     = pure []
+        go cur (q:qs) = do
+          hd   <- fstDec cur
+          rest <- case qs of
+                    [] -> pure []
+                    _  -> do tl <- sndDec cur; go tl qs
+          pure ((q, hd) : rest)
+    comps <- go scr ps
+    subs  <- mapM (\(q, hd) -> case q of
+                     PVar x    -> pure (Nothing, [(x, hd)])
+                     PWildcard -> pure (Nothing, [])
+                     _         -> do (pq, bq) <- patPred hd q; pure (Just pq, bq)) comps
+    g <- foldM (\acc mp -> maybe (pure acc) (andP acc) mp) t (map fst subs)
+    pure (g, concatMap snd subs)
   PList [] -> do
     p <- isNilP scr; pure (p, [])
   -- Treat singleton list patterns as a cons with empty tail for consistent
