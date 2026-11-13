@@ -37,9 +37,11 @@ dstN nid = "n" <> showT nid
 dstS nid = "s" <> showT nid
 
 -- tag   ----------------------------------------------------------------
--- Use globally unique callgroup tags to avoid collisions in the preprocessor.
+-- Globally unique callgroup names. FlowASM's callgroup macro substitutes the
+-- name textually in every later line, so the trailing '_' keeps "cg7_" from
+-- matching inside "cg70_". Must agree with Builder.callgroupPort.
 tagName :: NodeId -> T.Text
-tagName nid = "cg" <> showT nid
+tagName nid = "cg" <> showT nid <> "_"
 
 -- "fun#i" -> "fun[i]"
 argAsFunSlot :: String -> T.Text
@@ -84,58 +86,6 @@ buildInputs g =
         let src = outName g s sp
         in M.insertWith (++) (d,dp) [src] m
   in M.map nub (foldl step M.empty (dgEdges g))
-
-buildPreds :: DGraph DNode -> M.Map (NodeId,String) [NodeId]
-buildPreds g =
-  let step m (s,_sp,d,dp) = M.insertWith (++) (d,dp) [s] m
-  in foldl step M.empty (dgEdges g)
-
-lookupPreds :: M.Map (NodeId,String) [NodeId] -> NodeId -> String -> [NodeId]
-lookupPreds preds nid port = M.findWithDefault [] (nid, port) preds
-
-parseNodeId :: T.Text -> Maybe NodeId
-parseNodeId t =
-  case T.uncons t of
-    Just ('n', rest) | not (T.null rest) ->
-      case reads (T.unpack rest) of
-        [(n,"")] -> Just n
-        _        -> Nothing
-    _ -> Nothing
-
-callgroupForRetSnd :: DGraph DNode -> M.Map (NodeId,String) [NodeId] -> NodeId -> Maybe NodeId
-callgroupForRetSnd g _preds rs =
-  case M.lookup rs (dgNodes g) of
-    Just NRetSnd{..} -> Just cgId
-    _                -> Nothing
-
-callgroupForValTag :: DGraph DNode -> M.Map (NodeId,String) [NodeId] -> NodeId -> Maybe NodeId
-callgroupForValTag g preds vt =
-  case lookupPreds preds vt "1" of
-    (tv:_) ->
-      case lookupPreds preds tv "0" of
-        (rs:_) -> callgroupForRetSnd g preds rs
-        _      -> Nothing
-    _ -> Nothing
-
-sortByCallgroup
-  :: (NodeId -> Maybe NodeId)
-  -> [T.Text]
-  -> [T.Text]
-sortByCallgroup cgOf srcs =
-  let withKey = [ (cg, s)
-                | s <- srcs
-                , Just nid <- [parseNodeId s]
-                , Just cg  <- [cgOf nid]
-                ]
-      without = [ s
-                | s <- srcs
-                , case parseNodeId s of
-                    Nothing  -> True
-                    Just nid -> case cgOf nid of
-                                  Nothing -> True
-                                  Just _  -> False
-                ]
-  in map snd (sortOn fst withKey) ++ without
 
 orderedPins :: M.Map (NodeId,String) [T.Text] -> NodeId -> [String]
 orderedPins im k = [ p | (n,p) <- M.keys im, n==k ]
@@ -188,24 +138,17 @@ emitNode g im (nid, dn) =
     NCallGroup{..} ->
       [ "callgroup(\"" <> tagName nid <> "\",\"" <> T.pack nName <> "\")" ]
 
+    -- TALM: callsnd/retsnd take one source and the callgroup as
+    -- immediate; ret takes the result and the return addresses.
     NCallSnd{..} ->
-      let src0   = fmtOp (gi "0")
-          tagSrc = fmtOp (gi "1")
-      in  [ "callsnd " <> argAsFunSlot nName
-            <> ", " <> src0 <> ", " <> tagSrc <> ", " <> showT taskId ]
+      [ "callsnd " <> argAsFunSlot nName
+        <> ", " <> fmtOp (gi "0") <> ", " <> tagName cgId ]
 
     NRetSnd{..} ->
-      let src0   = fmtOp (gi "0")
-          tagSrc = fmtOp (gi "1")
-          cgTag  = tagName cgId
-      in  [ "retsnd " <> dstN nid <> ", " <> src0 <> ", " <> tagSrc <> ", " <> cgTag ]
+      [ "retsnd " <> dstN nid <> ", " <> fmtOp (gi "0") <> ", " <> tagName cgId ]
 
     NRet{..} ->
-      let preds = buildPreds g
-          src0s = sortByCallgroup (callgroupForValTag g preds) (gi "0")
-          src0  = fmtOp src0s
-          src1  = fmtOp (gi "1")
-      in  [ "ret " <> T.pack nName <> ", " <> src0 <> ", " <> src1 ]
+      [ "ret " <> T.pack nName <> ", " <> fmtOp (gi "0") <> ", " <> fmtOp (gi "1") ]
 
     -------------------------------------------------- tag/val
     NTagVal{} -> one1 "tagval"

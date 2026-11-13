@@ -118,6 +118,8 @@ Other useful overrides (advanced):
 ## Design Decisions (catalog)
 
 - **Dataflow graph is the source of truth**: `.dot` (Dataflow) and `.fl` (TALM) represent the same graph; `.fl` is the executable form for Trebuchet.
-- **Function calls are explicit in TALM**: calls use `callgroup` + `callsnd`/`retsnd` + `ret` to carry tags and execution IDs correctly across call instances.
+- **Function calls use TALM's call protocol**: each call site is a `callgroup`; arguments go through `callsnd f[i], arg, cg` (the call instance is identified by the exec tag, tags pass through unchanged), the return address through `retsnd`, and `ret f, result, [retsnds]` routes the result back to output `f.cg`. Multi-argument calls synchronize their arguments first so every `callsnd` of a callgroup sees the call instances in the same order.
+- **Float multiply/divide are builtin supers** (`s10`/`s11`; user supers start at `s12`): Trebuchet has no `fmul`/`fdiv`. Float subtraction/negation flip the sign bit with `addi`.
+- **Placement**: `ribault` spreads instructions over the PEs in contiguous blocks and raises the PE count if needed, since Trebuchet holds at most 500 instructions per PE.
 - **Supers are compiled as shared libraries**: `libsupers.so` is produced with `-no-hs-main` and an RTS shim. Dependencies are bundled under `ghc-deps/` and loaded via rpath.
 - **Threaded RTS by default**: `SUPERS_THREADED=1` to allow parallel execution in Trebuchet.

@@ -77,14 +77,12 @@ data BuildS = BuildS
   , bsListFuns   :: !(S.Set Ident) -- ^ Functions that build/return lists.
   , bsRetVals    :: !(M.Map Ident Port) -- ^ Return value port for each function.
   , bsGuard      :: !(Maybe Port)  -- ^ Optional guard for gating calls in branches.
-  , bsCallIx     :: !(M.Map Ident Int) -- ^ Callgroup output indices per function.
-  , bsSelfCalls  :: !(M.Map Ident Int) -- ^ Total concurrent calls per function scope (stride).
   , bsScopeK     :: !Int               -- ^ Scope-level call counter for unique k values (reset on withActive).
   }
 
 -- | Initial empty builder state.
 emptyS :: BuildS
-emptyS = BuildS emptyGraph [M.empty] M.empty [] S.empty S.empty M.empty Nothing M.empty M.empty 0
+emptyS = BuildS emptyGraph [M.empty] M.empty [] S.empty S.empty M.empty Nothing 0
 
 -- | Builder monad with unique-id generation.
 newtype Build a = Build { unBuild :: StateT BuildS Unique a }
@@ -223,61 +221,6 @@ incTag p = do
   connectPlus p (InstPort nid "0")
   pure (out0 nid)
 
--- | Increment tag by an immediate (inctagi).
-incTagI :: Int -> Port -> Build Port
-incTagI k p = do
-  nid <- newNode ("inctagi_" ++ show k) (NIncTagI "" k)
-  connectPlus p (InstPort nid "0")
-  pure (out0 nid)
-
--- | Decrement tag by an immediate (inctagi with negative).
-decTagI :: Int -> Port -> Build Port
-decTagI k p = incTagI (-k) p
-
--- | Build a child tag: simple depth counter, tag + 1.
--- Call groups handle call-site routing.
--- | Build a child tag for a recursive call.
--- Linear (1 self-call): additive, tag + 1.  Max depth = 2^63.
--- Tree (>1 self-calls): multiplicative, tag * stride + k.
---   Stride = max self-calls in the function. Max depth = 63/log2(stride).
--- Call groups handle return routing via ret/retsnd.
-mkChildTag :: Bool -> Int -> Int -> Port -> Build Port
-mkChildTag isTree stride k parent
-  | isTree = do
-      -- multiplicative: parent * stride + k (k ∈ [1..stride])
-      tv <- newNode "tagval" (NTagVal "")
-      connectPlus parent (InstPort tv "0")
-      scaled <- mulI (out0 tv) (stride + 1)
-      bumped <- addI scaled k
-      vt <- newNode "valtag" (NValTag "")
-      connectPlus parent (InstPort vt "0")
-      connectPlus bumped (InstPort vt "1")
-      pure (out0 vt)
-  | otherwise = incTagI 1 parent  -- additive: depth counter
-
--- | Recover parent tag from a child tag.
-mkParentTag :: Bool -> Int -> Port -> Build Port
-mkParentTag isTree stride child
-  | isTree = do
-      -- divisive: child / (stride + 1)
-      tv <- newNode "tagval" (NTagVal "")
-      connectPlus child (InstPort tv "0")
-      divN <- newNode ("divi_" ++ show (stride + 1)) (NDivI "" (stride + 1))
-      connectPlus (out0 tv) (InstPort divN "0")
-      vt <- newNode "valtag" (NValTag "")
-      connectPlus child (InstPort vt "0")
-      connectPlus (out0 divN) (InstPort vt "1")
-      pure (out0 vt)
-  | otherwise = decTagI 1 child  -- additive: depth counter
-
--- | Allocate a callgroup output index for function @f@ (0-based).
-nextCallIx :: Ident -> Build Int
-nextCallIx f = Build $ do
-  s <- get
-  let i = M.findWithDefault 0 f (bsCallIx s)
-  put s { bsCallIx = M.insert f (i + 1) (bsCallIx s) }
-  pure i
-
 -- | Align a guard's exec/tag to match a value (so steers can fire).
 alignGuardTo :: Port -> Port -> Build Port
 alignGuardTo val guard = do
@@ -286,12 +229,9 @@ alignGuardTo val guard = do
     Just k -> constFrom val k
     Nothing -> retagTo val guard
 
--- | Record/lookup the canonical return-value port for a function.
+-- | Record the canonical return-value port for a (zero-argument) function.
 setRetVal :: Ident -> Port -> Build ()
 setRetVal f p = Build $ modify (\s -> s { bsRetVals = M.insert f p (bsRetVals s) })
-
-lookupRetVal :: Ident -> Build (Maybe Port)
-lookupRetVal f = Build $ gets (M.lookup f . bsRetVals)
 
 -- | Insert a 'Binding' for an identifier into the current environment.
 insertB :: Ident -> Binding -> Build ()
@@ -513,6 +453,11 @@ builtinPrintFloatList = 8
 builtinPrintFloatMatrix :: Int
 builtinPrintFloatMatrix = 9
 
+-- | Float multiply/divide: TALM has no fmul/fdiv instruction.
+builtinFMul, builtinFDiv :: Int
+builtinFMul = 10
+builtinFDiv = 11
+
 superNameFromNum :: Int -> String
 superNameFromNum n = "s" ++ show n
 
@@ -574,14 +519,15 @@ mulI p k = do
   connect p (InstPort nid "0")
   pure (out0 nid)
 
--- fmuli helper (sem aliases!)
-
--- | Multiply by a floating immediate (no alias expansion).
-fmulI :: Port -> Float -> Build Port
-fmulI p k = do
-  nid <- newNode ("fmuli_" ++ show k) (NFMulI "" k)
+-- | Float negation: flip the IEEE-754 sign bit by adding 2^31 to the raw
+-- bits (wraps mod 2^32). Trebuchet has no fmul/fmuli in eval.
+fnegP :: Port -> Build Port
+fnegP p = do
+  nid <- newNode "fneg" (NAddI "" (-2147483648))
   connect p (InstPort nid "0")
   pure (out0 nid)
+
+-- fmuli helper (sem aliases!)
 
 -- | Port representing the empty list.
 nilP :: Build Port
@@ -742,79 +688,11 @@ matchVal v pat = case (pat, v) of
 
 -- API ------------------------------------------------------------------
 
--- | Count calls per callee in an expression, returning a map callee→count.
--- Uses MAX across if/case branches (only one branch executes at runtime).
--- Uses SUM for sequential code (let bindings, args, etc.).
-callCounts :: Expr -> M.Map Ident Int
-callCounts = go
-  where
-    go (Var _)         = M.empty
-    go (Lit _)         = M.empty
-    go (Lambda _ e)    = go e
-    go (If c t e)      = go c `addM` maxM (go t) (go e)
-    go (Case e alts)   = go e `addM` maxAll [go b | (_, b) <- alts]
-    go (Let ds b)      = sumAll [go body | FunDecl _ _ body <- ds] `addM` go b
-    go (App (Var g) a) = M.insertWith (+) g 1 (go a)
-    go (App fn a)      = go fn `addM` go a
-    go (BinOp _ l r)   = go l `addM` go r
-    go (UnOp _ e)      = go e
-    go (List es)       = sumAll (map go es)
-    go (Tuple es)      = sumAll (map go es)
-    go (Cons h t)      = go h `addM` go t
-    go (Super{})       = M.empty
-    addM  = M.unionWith (+)
-    maxM  = M.unionWith max
-    maxAll [] = M.empty
-    maxAll ms = foldl1 maxM ms
-    sumAll    = foldl addM M.empty
-
--- | Pre-scan: per-function stride.
--- A function needs multiplicative tags (stride > 1) when:
---   (a) it calls the same callee more than once (max_per_callee > 1), OR
---   (b) it calls multiple DISTINCT recursive functions (their additive chains overlap)
--- In those cases, stride = total concurrent calls (so k ≤ stride).
--- Otherwise stride = 1 (additive, unlimited depth).
--- Calls to the function's own parameters are excluded (they go to separate bodies).
-preScanSelfCalls :: [Decl] -> M.Map Ident Int
-preScanSelfCalls decls =
-  let recFuns = S.fromList [ f | FunDecl f _ body <- decls
-                                , M.member f (callCounts body) ]
-  in M.fromList [ (f, computeStride recFuns ps body) | FunDecl f ps body <- decls ]
-  where
-    computeStride recFuns ps body =
-      let cc = callCounts body
-          paramSet = S.fromList ps
-          ccF = M.filterWithKey (\k _ -> not (S.member k paramSet)) cc
-          totalCalls = sum (M.elems ccF)
-          maxPerCallee = case M.elems ccF of { [] -> 0; xs -> maximum xs }
-          distinctRecCallees = M.size (M.filterWithKey (\k _ -> S.member k recFuns) ccF)
-          needsMultiplicative = maxPerCallee > 1 || distinctRecCallees > 1
-      in if needsMultiplicative then max 1 totalCalls else 1
-
--- | Allocate a scope-level call-site index (1-based).
--- Unique across ALL calls within the current scope, regardless of callee.
-nextScopeK :: Build Int
-nextScopeK = Build $ do
-  s <- get
-  let k = bsScopeK s + 1
-  put s { bsScopeK = k }
-  pure k
-
--- | Get the stride (max calls to any single callee) for the currently active function.
-getActiveStride :: Build Int
-getActiveStride = Build $ do
-  s <- get
-  case bsActive s of
-    (f:_) -> pure (M.findWithDefault 1 f (bsSelfCalls s))
-    []    -> pure 1
-
 -- | Build a 'DFG' from a 'Program'. Also assigns super names first.
 buildProgram :: Program -> DFG
 buildProgram p0 =
   let Program decls = assignSuperNames (desugarProgram p0)
-      selfCalls = preScanSelfCalls decls
       (_, st) = runBuild $ do
-        Build $ modify (\s -> s { bsSelfCalls = selfCalls })
         mapM_ (\(FunDecl f ps body) -> insertB f (BLam ps body)) decls
         mapM_ buildZero decls
   in bsGraph st
@@ -871,16 +749,17 @@ ensureBuilt f ps body = do
      else do
        when (exprHasList body) (markListFun f)
        when (exprHasFloat body) (markFloatFun f)
-       retStub <- newNode (f ++ "_retstub") (NAddI "" 0)
-       setRetVal f (out0 retStub)
+       -- Create the ret node first so recursive call sites can target it.
+       retN <- retNodeId f
        _ <- withActive f $ withNoGuard $ withEnv $ do
               forM_ (zip [0..] ps) $ \(i, v) -> do
                 let slot = i + 1
                 a <- argNode f slot
                 insertB v (BVal (Scalar a))
               res <- goScalar body
-              _ <- retNodeId f
-              connectPlus res (InstPort retStub "0")
+              -- TALM ret: port 0 = result (callee exec), port 1 = return
+              -- addresses from the retsnds of every call site.
+              connectPlus res (InstPort retN "0")
        pure ()
 
 -- variável livre -> NArg
@@ -907,7 +786,9 @@ portIsFloat p = Build $ gets $ \s -> isFloatNode s (pNode p)
       Just NFSub{}           -> True
       Just NFMul{}           -> True
       Just NFDiv{}           -> True
+      Just NSuper{ superNum = k } -> k == builtinFMul || k == builtinFDiv
       Just (NRetSnd f _ _)   -> S.member f (bsFloatFuns s)
+      Just (NRet f)          -> S.member f (bsFloatFuns s)
       Just NIncTagI{}        -> tracePort0 s nid
       Just NValTag{}         -> tracePort0 s nid
       Just NAddI{}           -> tracePort0 s nid
@@ -932,6 +813,7 @@ isListNode :: BuildS -> NodeId -> Bool
 isListNode s nid = case M.lookup nid (dgNodes (bsGraph s)) of
   Just (NSuper { superNum = n }) -> n == 0  -- builtinListCons
   Just (NRetSnd f _ _)   -> S.member f (bsListFuns s)
+  Just (NRet f)          -> S.member f (bsListFuns s)
   Just NSteer{}          -> tracePort1 s nid  -- steer: check input port 1
   Just NIncTagI{}        -> tracePort0 s nid
   Just NValTag{}         -> tracePort0 s nid
@@ -1033,12 +915,12 @@ goExpr = \case
     Scalar <$> case op of
       Add | fctx      -> bin2 "fadd" (NFAdd "")  pl pr
           | otherwise -> bin2 "add"  (NAdd  "")  pl pr
-      Sub | fctx      -> do ny <- fmulI pr (-1.0)     -- fsub = fadd(x, y*-1)
+      Sub | fctx      -> do ny <- fnegP pr            -- fsub = fadd(x, -y)
                             bin2 "fadd" (NFAdd "") pl ny
           | otherwise -> bin2 "sub"  (NSub  "")  pl pr
-      Mul | fctx      -> bin2 "fmul" (NFMul "")  pl pr
+      Mul | fctx      -> callBuiltinSuper builtinFMul [pl, pr]
           | otherwise -> bin2 "mul"  (NMul  "")  pl pr
-      Div | fctx      -> bin2 "div"  (NDiv  "")  pl pr  -- sem fdiv no ASM
+      Div | fctx      -> callBuiltinSuper builtinFDiv [pl, pr]
           | otherwise -> bin2 "div"  (NDiv  "")  pl pr
       Mod -> do
         qN <- bin2Node "div" (NDiv "") pl pr
@@ -1062,7 +944,10 @@ goExpr = \case
   UnOp u e -> do
     pe <- goScalar e
     Scalar <$> case u of
-      Neg -> do z <- constI 0; bin2 "sub" (NSub "") z pe
+      Neg -> do
+        fl <- (||) <$> isFloatActive <*> portIsFloat pe
+        if fl then fnegP pe
+              else do z <- constI 0; bin2 "sub" (NSub "") z pe
       Not -> notP pe
 
   Super nm inputs _ -> do
@@ -1118,6 +1003,36 @@ withActive f m = Build $ do
 funTaskId :: Ident -> Int
 funTaskId _ident = 0
 
+-- | Make all arguments of a call reach their callsnds in the same instance
+-- order. TALM pairs the k-th execution of every callsnd in a callgroup (each
+-- one counts its own executions into the exec tag), so if arguments of
+-- different call instances arrive in different orders (e.g. one argument is
+-- the result of a recursive call) values of different instances get paired.
+-- A single sync token s = sum (a_i - a_i) = 0 fires once per instance after
+-- all arguments are present; each callsnd receives a_i + s, so every callsnd
+-- observes the instances in s's firing order. Integer add/sub on the raw
+-- operand bits leaves floats and list handles unchanged.
+syncArgs :: [Port] -> Build [Port]
+syncArgs argv = case argv of
+  []  -> pure []
+  [_] -> pure argv
+  _   -> do
+    zs <- mapM (\a -> out0 <$> rawBin (NSub "") a a) argv
+    s  <- foldM (\acc z -> out0 <$> rawBin (NAdd "") acc z) (head zs) (tail zs)
+    mapM (\a -> out0 <$> rawBin (NAdd "") a s) argv
+  where
+    rawBin nd a b = do
+      nid <- newNode "sync" nd
+      connectPlus a (InstPort nid "0")
+      connectPlus b (InstPort nid "1")
+      pure nid
+
+-- | Output port of a function's ret node that serves one call site.
+-- Codegen prints it as @f.cg<N>_@; the FlowASM callgroup macro rewrites
+-- @cg<N>_@ into that call site's callgroup index.
+callgroupPort :: NodeId -> String
+callgroupPort cg = "cg" ++ show cg ++ "_"
+
 -- nó de argumento formal
 
 -- | Ensure the formal argument node @fun#i@ exists and return its output port.
@@ -1142,16 +1057,6 @@ argNode fun i = Build $ do
 
 -- formal + alias para o real
 
--- | Bind a formal parameter to the actual input port, wiring aliases.
-bindFormal :: String -> Int -> Ident -> Port -> Build ()
-bindFormal fun i formal actual = do
-  let slot = i + 1
-  ap <- argNode fun slot
-  insertB formal (BVal (Scalar ap))
-  case ap of
-    InstPort nid _ -> connectPlus actual (InstPort nid "0")
-    _              -> pure ()
-
 -- | Apply a function or lambda to argument expressions.
 goApp :: Expr -> [Expr] -> Build Val
 goApp fun args = case fun of
@@ -1172,6 +1077,13 @@ goApp fun args = case fun of
                _         -> builtinPrint
     Scalar <$> callBuiltinSuper sn [pArg]
 
+  -- Function call, TALM call protocol:
+  --   callgroup(cg, f)              per call site; cg becomes its index
+  --   callsnd f[i], arg_i, cg       exec := cg<<20 | call count, tag kept
+  --   retsnd  r, arg_0, cg          value := caller exec (return address)
+  --   ret     f, result, [r...]     routes to output port cg and restores
+  --                                 the caller exec; consumers read f.cg
+  -- Call instances are told apart by exec, so tags pass through unchanged.
   Var f -> do
     argv0 <- mapM goScalar args
     argv1 <- mapM guardIfNeeded argv0
@@ -1185,77 +1097,33 @@ goApp fun args = case fun of
 
     let tid = funTaskId f
     cg <- newNode f (NCallGroup f)
-    cgIx <- nextCallIx f
-    let cgTag = "cg" ++ show cg
-    recCall <- isActiveFun f
-    listCall <- isListFun f
-    -- Determine tag scheme based on calling context:
-    -- stride > 1 → multiplicative (tag = parent * (stride+1) + k)
-    -- stride = 1 → additive (tag = parent + 1)
-    -- k is unique across ALL calls within the current scope.
-    stride <- getActiveStride
-    let isTree = stride > 1
-    k <- nextScopeK
-    argv' <- pure argv
-    tagTokParent <- case argv of
-      (a0:_) -> pure a0
-      []     -> constI 0
-    tagTokChild <- mkChildTag isTree stride k tagTokParent
-    argvTagged <-
-      mapM (mkChildTag isTree stride k) argv'
-    callOuts <- forM (zip [0..] argvTagged) $ \(i,a) -> do
-      let slot = i + 1
-      cs <- newNode (f ++ "#" ++ show slot) (NCallSnd (f ++ "#" ++ show slot) tid cg)
-      connectPlus a   (InstPort cs "0")
-      connectPlus tagTokChild (InstPort cs "1")
+    argvS <- syncArgs argv
+    forM_ (zip [1..] argvS) $ \(slot, a) -> do
+      let nm = f ++ "#" ++ show (slot :: Int)
+      cs <- newNode nm (NCallSnd nm tid cg)
+      connectPlus a (InstPort cs "0")
       ap <- argNode f slot
       case ap of
         InstPort nid _ -> connectPlus (out0 cs) (InstPort nid "0")
         _              -> pure ()
-      pure (out0 cs)
 
+    retTok <- case argvS of
+      (a0:_) -> pure a0
+      []     -> constI 0
     rs <- newNode (f ++ "#0") (NRetSnd (f ++ "#0") tid cg)
-    connectPlus tagTokChild (InstPort rs "1")
-
+    connectPlus retTok (InstPort rs "0")
     retN <- retNodeId f
-    connectPlus tagTokChild (InstPort rs "0")
-    let rsTag = out0 rs
-    connectPlus rsTag (InstPort retN "1")
-    mres <- lookupRetVal f
-    resOut <- case mres of
-      Just res -> do
-        r <- retagTo rsTag res
-        connectPlus r (InstPort retN "0")
-        mkParentTag isTree stride r
-      Nothing -> do
-        z <- constFrom rsTag 0
-        connectPlus z (InstPort retN "0")
-        mkParentTag isTree stride z
-    pure (Scalar resOut)
+    connectPlus (out0 rs) (InstPort retN "1")
+    pure (Scalar (InstPort retN (callgroupPort cg)))
 
+  -- Lambda applied in place: beta-reduce by binding formals to the actuals.
   Lambda ps body -> do
-    let fname = "lambda"
-        tid   = funTaskId fname
     argv0 <- mapM goScalar args
     argv1 <- mapM guardIfNeeded argv0
     argv <- alignExecInputs argv1
-    cg <- newNode fname (NCallGroup fname)
-    tagTok <- case argv of
-      (a0:_) -> pure a0
-      []     -> constI 0
-    _callOuts <- forM (zip [0..] argv) $ \(i,a) -> do
-      let slot = i + 1
-      cs <- newNode (fname ++ "#" ++ show slot) (NCallSnd (fname ++ "#" ++ show slot) tid cg)
-      connectPlus a   (InstPort cs "0")
-      connectPlus tagTok (InstPort cs "1")
-      pure (out0 cs)
-    rs <- newNode (fname ++ "#0") (NRetSnd (fname ++ "#0") tid cg)
-    connectPlus tagTok (InstPort rs "1")
-    res <- withEnv $ do
-             forM_ (zip3 [0..] ps argv) $ \(i,v,p) -> bindFormal fname i v p
-             goExpr body
-    connectPlus tagTok (InstPort rs "0")
-    pure res
+    withEnv $ do
+      forM_ (zip ps argv) $ \(v, a) -> insertB v (BVal (Scalar a))
+      goExpr body
 
   _ -> do
     _ <- mapM goExpr args
@@ -1465,6 +1333,8 @@ patPred scr = \case
   -- Treat singleton list patterns as a cons with empty tail for consistent
   -- guard construction and binding behavior.
   PList [p] -> patPred scr (PCons p (PList []))
+  -- Longer list patterns: [p1, p2, ..] = p1 : [p2, ..].
+  PList (p:ps) -> patPred scr (PCons p (PList ps))
   PCons ph pt -> do
     nz <- notP =<< isNilP scr
     hd <- fstDec scr

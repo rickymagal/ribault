@@ -23,7 +23,7 @@ import Data.List (dropWhileEnd)
 -- | Generate a complete Supers.hs module for a given program and its supers.
 emitSupersModule :: String -> [SuperSpec] -> String
 emitSupersModule baseName specs =
-      let specs' = filter (\(SuperSpec nm _ _) -> nm `notElem` ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9"]) specs
+      let specs' = filter (\(SuperSpec nm _ _) -> nm `notElem` [ "s" ++ show n | n <- [0 .. 11 :: Int] ]) specs
       in unlines $
       [ "{-# LANGUAGE ForeignFunctionInterface #-}"
       , "-- Automatically generated for program: " ++ baseName
@@ -145,6 +145,15 @@ emitSupersModule baseName specs =
       , "{-# NOINLINE sndDec #-}"
       , "sndDec h = unsafePerformIO (if h == handleNil then pure 0 else snd <$> readPairIO h)"
       , ""
+      , "-- Arity of every super (number of TALM operands its superN wrapper"
+      , "-- reads); parsed by tools/build_supers.sh. Trebuchet does not"
+      , "-- NULL-terminate the operand array, so wrappers must know the count."
+      , "-- @arity s0 2"
+      ]
+      ++ [ "-- @arity s" ++ show n ++ " 1" | n <- [1 .. 9 :: Int] ]
+      ++ [ "-- @arity s10 2", "-- @arity s11 2" ]
+      ++
+      [ ""
       , "-- Builtins: s0..s3 reserved for list ops"
       , "foreign export ccall \"s0\" s0 :: Ptr Int64 -> Ptr Int64 -> IO ()"
       , "s0 :: Ptr Int64 -> Ptr Int64 -> IO ()"
@@ -233,6 +242,21 @@ emitSupersModule baseName specs =
       , "  else print (map toListF (toList v))"
       , "  hFlush stdout"
       , "  poke pout v"
+      , ""
+      , "-- s10/s11: float multiply/divide (TALM has no fmul/fdiv)"
+      , "foreign export ccall \"s10\" s10 :: Ptr Int64 -> Ptr Int64 -> IO ()"
+      , "s10 :: Ptr Int64 -> Ptr Int64 -> IO ()"
+      , "s10 pin pout = do"
+      , "  a <- peekElemOff pin 0"
+      , "  b <- peekElemOff pin 1"
+      , "  poke pout (fromFloat (toFloat a * toFloat b))"
+      , ""
+      , "foreign export ccall \"s11\" s11 :: Ptr Int64 -> Ptr Int64 -> IO ()"
+      , "s11 :: Ptr Int64 -> Ptr Int64 -> IO ()"
+      , "s11 pin pout = do"
+      , "  a <- peekElemOff pin 0"
+      , "  b <- peekElemOff pin 1"
+      , "  poke pout (fromFloat (toFloat a / toFloat b))"
       ]
       ++ concatMap emitOne specs'
 
@@ -244,7 +268,9 @@ emitOne (SuperSpec nm inputs bodyRaw) =
       funcName = if null inputs then nm ++ "_f" else head inputs
       args     = if length inputs > 1 then tail inputs else []
       nArgs    = length args
-  in if null bodyCore
+      -- The Builder wires the args, or the single name when there are none.
+      arityMark = "-- @arity " ++ nm ++ " " ++ show (max 1 nArgs)
+  in (arityMark :) $ if null bodyCore
      then
        [ ""
        , "-- " ++ nm

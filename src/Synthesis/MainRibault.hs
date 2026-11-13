@@ -63,11 +63,15 @@ main = do
     , "-o", buildDir </> baseName
     ]
 
-  -- 4. Trebuchet: executar
+  -- 4. Placement: spread instructions over the PEs (see 'placePEs').
+  let plaFile = buildDir </> (baseName ++ ".pla")
+  pes <- placePEs nPEs plaFile
+
+  -- 5. Trebuchet: executar
   let interp = talmDir </> "interp" </> "interp"
   absLib <- makeAbsolute (buildDir </> "libsupers.so")
   ec <- rawSystem interp $
-    [ show nPEs
+    [ show pes
     , buildDir </> (baseName ++ ".flb")
     , buildDir </> (baseName ++ ".pla")
     , absLib
@@ -95,6 +99,38 @@ parseCliArgs = getArgs >>= go Nothing Nothing
     usage = do
       hPutStrLn stderr "Usage: ribault [-n <PEs>] <program.hss> [-- app-args...]"
       exitFailure
+
+-- ----------------------------------------------------------------
+-- Placement
+-- ----------------------------------------------------------------
+
+-- | Instructions one Trebuchet PE can hold: interp.h declares
+-- @instr_t instrs[MAX_INSTRS]@ per PE with @MAX_INSTRS 500@.
+maxInstrsPerPE :: Int
+maxInstrsPerPE = 500
+
+-- | Rewrite the FlowASM placement file (first line = instruction count, then
+-- one PE id per instruction) so instructions are split into contiguous
+-- blocks over the PEs. FlowASM alone puts everything on PE 0. If the program
+-- does not fit in the requested PEs, the PE count is raised to the minimum
+-- that fits. Returns the PE count to run with.
+placePEs :: Int -> FilePath -> IO Int
+placePEs nPEs plaFile = do
+  txt <- readFile plaFile
+  let n = case lines txt of
+            (h:_) | [(k, "")] <- reads h -> k
+            _ -> 0 :: Int
+      needed = (n + maxInstrsPerPE - 1) `div` maxInstrsPerPE
+      pes    = maximum [1, nPEs, needed]
+      per    = max 1 ((n + pes - 1) `div` pes)
+  length txt `seq` pure ()
+  if pes > nPEs
+    then info ("program has " ++ show n ++ " instructions; raising PEs from "
+               ++ show nPEs ++ " to " ++ show pes
+               ++ " (Trebuchet holds " ++ show maxInstrsPerPE ++ " per PE)")
+    else pure ()
+  writeFile plaFile (unlines (show n : [ show (i `div` per) | i <- [0 .. n - 1] ]))
+  pure pes
 
 -- ----------------------------------------------------------------
 -- Helpers

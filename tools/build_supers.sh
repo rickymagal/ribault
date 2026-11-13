@@ -313,6 +313,15 @@ gen_empty_aliases_c() {
 gen_super_wrappers_c() {
   local out_c="$1"
   local max="$2"
+  local hs="${3:-}"
+
+  # Operand count per super, from the "-- @arity sN K" markers in Supers.hs.
+  declare -A arity=()
+  if [[ -n "$hs" && -f "$hs" ]]; then
+    while read -r _ _ nm k; do
+      arity["${nm#s}"]="$k"
+    done < <(grep -E '^-- @arity s[0-9]+ [0-9]+$' "$hs")
+  fi
 
   {
     echo '#include <stdint.h>'
@@ -338,17 +347,17 @@ gen_super_wrappers_c() {
 
     local n=0
     while [[ "$n" -lt "$max" ]]; do
+      local k="${arity[$n]:-1}"
       echo "extern void s${n}(int64_t *in, int64_t *out) WEAK_FN;"
       echo "EXPORT_FN USED_FN void super${n}(oper_t **oper, oper_t *result) {"
-      # Supers may take up to 16 inputs. Iterate while non-NULL so any
-      # arity from 1..16 is forwarded correctly. Slots past the last
-      # valid operand are zeroed so the Haskell side never reads
-      # uninitialized memory.
+      # Read exactly the super's operand count: Trebuchet does not
+      # NULL-terminate oper[]. Values are read through the 32-bit .i member
+      # (ALU results only set it; list handles are small StablePtr indices)
+      # and sign-extended; unused slots stay zero.
       echo "  int64_t in[64] = {0};"
       echo "  int64_t out[1];"
-      echo "  for (int _i = 0; _i < 64; ++_i) {"
-      echo "    if (oper[_i] == NULL) break;"
-      echo "    in[_i] = (int64_t)oper[_i]->value.li;"
+      echo "  for (int _i = 0; _i < ${k}; ++_i) {"
+      echo "    in[_i] = (int64_t)oper[_i]->value.i;"
       echo "  }"
       echo "  if (s${n}) {"
       echo "    s${n}(in, out);"
@@ -562,7 +571,7 @@ generate_one() {
   fi
 
   gen_empty_aliases_c "$out_dir/supers_aliases.c"
-  gen_super_wrappers_c "$out_dir/supers_wrappers.c" "$max"
+  gen_super_wrappers_c "$out_dir/supers_wrappers.c" "$max" "$out_hs"
 
   local ghc="${GHC:-ghc}"
   local cc="${CC:-gcc}"
