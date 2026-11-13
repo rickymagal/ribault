@@ -53,7 +53,14 @@ type DFG = DGraph DNode
 --   pair encoding built by the list supers).
 -- * 'Stream': a statically sized, length-prefixed stream: the count port
 --   (an int node) plus one payload port per position @0..N-1@.
-data Val = Scalar Port | Stream Port [Port]
+-- * 'DStream': a dynamic, loop-carried stream. With t0 the tag of the
+--   context that owns it: 'dsCount' is the element count at tag t0, and
+--   element k arrives on 'dsElem' at tag t0+1+k together with its index k on
+--   'dsIdx' (the index is what lets head/tail pick elements out).
+data Val
+  = Scalar Port
+  | Stream Port [Port]
+  | DStream { dsCount :: Port, dsElem :: Port, dsIdx :: Port }
 
 -- | Builder-time binding: either a realized 'Val' or a lambda to be built.
 data Binding = BVal Val | BLam [Ident] Expr
@@ -619,6 +626,10 @@ streamToPair = \case
   Scalar p      -> pure p
   Stream _ []   -> nilP
   Stream _ ps   -> do z <- nilP; foldrM' pairEnc z ps
+  DStream c e _ -> do
+    -- Right fold with cons over the elements (pair encoding at a boundary).
+    nil0 <- constFrom c 0
+    backFold c [] c e nil0 (\_ h acc -> pairEnc h acc)
 
 -- | Use a value in scalar context; streams are re-encoded via 'streamToPair'.
 asScalar :: Val -> Build Port
@@ -633,7 +644,7 @@ data StaticMatch = SMNo | SMYes | SMDyn
   deriving (Eq)
 
 -- | Shape of a value as far as static matching is concerned.
-data Shape = SScalar | SStream Int
+data Shape = SScalar | SStream Int | SDyn
 
 -- | Classify a pattern against a shape without emitting nodes.
 staticMatch :: Pattern -> Shape -> StaticMatch
@@ -641,6 +652,9 @@ staticMatch pat sh = case (pat, sh) of
   (PWildcard, _)          -> SMYes
   (PVar _, _)             -> SMYes
   (_, SScalar)            -> SMDyn
+  (PLit _, SDyn)          -> SMNo
+  (PTuple _, SDyn)        -> SMNo
+  (_, SDyn)               -> SMDyn
   (PList ps, SStream n)   -> seqM n ps
   (PTuple ps, SStream n)  -> seqM n ps
   (PCons ph pt, SStream n)
@@ -661,6 +675,7 @@ shapeOf :: Val -> Shape
 shapeOf = \case
   Scalar _    -> SScalar
   Stream _ ps -> SStream (length ps)
+  DStream{}   -> SDyn
 
 -- | Build the bindings (and runtime predicate, if any) for a pattern that
 -- 'staticMatch' did not reject. @Nothing@ means statically true.
@@ -680,6 +695,20 @@ matchVal v pat = case (pat, v) of
             _         -> do c' <- subI c 1
                             matchVal (Stream c' xs) pt
     allOf [pure rh, pure rt]
+  (PList [], DStream c _ _) -> do
+    z  <- constFrom c 0
+    eq <- bin2 "equal" (NEqual "") c z
+    pure (Just eq, [])
+  (PList (q:qs), DStream{}) -> matchVal v (PCons q (PList qs))
+  (PCons ph pt, DStream c _ _) -> do
+    z  <- constFrom c 0
+    ne <- bin2 "gthan" (NGThan "") c z
+    h  <- dsHead v
+    rh <- matchVal (Scalar h) ph
+    rt <- case pt of
+            PWildcard -> pure (Nothing, [])
+            _         -> do t <- dsTail v; matchVal t pt
+    allOf [pure (Just ne, []), pure rh, pure rt]
   _ -> do f <- falseP; pure (Just f, [])
   where
     allOf ms = do
@@ -911,6 +940,7 @@ goExpr = \case
     case vb of
       Stream c ps -> do c' <- addI c 1; pure (Stream c' (pa : ps))
       Scalar pb   -> Scalar <$> pairEnc pa pb
+      DStream{}   -> dsCons pa vb
   List xs  -> staticStream xs
   Tuple xs -> staticStream xs
 
@@ -1164,8 +1194,13 @@ talmCall f vals = do
 --   @inctag [init, feedback]@, the condition steers each one, the continue
 --   side computes args' as feedback, the exit side evaluates base.
 --
+-- * List producer    f ps = if c then [] else e : f args'   (either order)
+--   Same forward loop plus an iteration counter: the continue side emits e
+--   (element k at tag t0+1+k) and its index; at exit the counter is the
+--   count N, moved back to t0. The result is a 'DStream'.
+--
 -- * List consumer    f .. xs .. = case xs of [] -> base; (h:t) -> E[h, f .. t ..]
---   (xs a static stream; the other parameters passed through unchanged).
+--   (xs a static stream or a DStream; the other parameters unchanged).
 --   Element k is placed at tag t0+1+k. The accumulator starts as base at tag
 --   t0+1+N and walks the tags down: each step does inctagi -1 and computes
 --   E with the element that lives at that tag, so the result is exactly the
@@ -1185,6 +1220,28 @@ data TailShape = TailShape
   , tsBase       :: Expr
   , tsArgs       :: [Expr]   -- ^ arguments of the self-call
   }
+
+-- | Shape of a list-producer body: @if c then [] else e : f args'@.
+data ProdShape = ProdShape
+  { prCond       :: Expr
+  , prExitOnTrue :: Bool     -- ^ True: @if c then [] else ..@
+  , prElem       :: Expr
+  , prArgs       :: [Expr]
+  }
+
+recognizeProducer :: Ident -> [Ident] -> Expr -> Maybe ProdShape
+recognizeProducer f ps = \case
+  If c a b
+    | occurs f c == 0, isNil a, Just (e, as) <- step b -> Just (ProdShape c True e as)
+    | occurs f c == 0, isNil b, Just (e, as) <- step a -> Just (ProdShape c False e as)
+  _ -> Nothing
+  where
+    isNil = \case { List [] -> True; _ -> False }
+    step = \case
+      Cons e r | occurs f e == 0
+               , Just as <- selfCall f (length ps) r
+               , all ((== 0) . occurs f) as -> Just (e, as)
+      _ -> Nothing
 
 -- | Shape of a list-consumer body.
 data ConsShape = ConsShape
@@ -1305,23 +1362,30 @@ lowerCall f vals = do
   case mdecl of
     Just (ps, body)
       | not isLocal, length ps == length vals, not (bsInLoop st) ->
-          case (recognizeTail f ps body, recognizeConsumer f ps body) of
-            (Just ts, _) -> Just <$> tailLoop ps ts vals
-            (_, Just cs) | Stream _ xs <- vals !! csIdx cs ->
-                             Just <$> consumerLoop ps cs xs vals
+          case ( recognizeTail f ps body, recognizeConsumer f ps body
+               , recognizeProducer f ps body ) of
+            (Just ts, _, _) -> Just <$> tailLoop ps ts vals
+            (_, Just cs, _) | Stream _ xs <- vals !! csIdx cs ->
+                                Just <$> consumerLoop ps cs (Left xs) vals
+            (_, Just cs, _) | DStream c e _ <- vals !! csIdx cs ->
+                                Just <$> consumerLoop ps cs (Right (c, e)) vals
+            (_, _, Just pr) -> Just <$> producerLoop ps pr vals
             _ | not isRec && hasStream -> Just <$> inlineCall ps body vals
             _ -> pure Nothing
       | not isLocal, length ps == length vals, not isRec, hasStream ->
           Just <$> inlineCall ps body vals
     _ -> pure Nothing
   where
-    isStreamVal = \case { Stream{} -> True; _ -> False }
+    isStreamVal = \case { Scalar{} -> False; _ -> True }
 
 -- | Gate a value by the current guard (all of its ports).
 guardVal :: Val -> Build Val
 guardVal = \case
   Scalar p    -> Scalar <$> guardIfNeeded p
   Stream c ps -> Stream <$> guardIfNeeded c <*> mapM guardIfNeeded ps
+  -- Elements live at other tags; gating the count (and hence any loop that
+  -- reads them) is enough.
+  DStream c e i -> (\c' -> DStream c' e i) <$> guardIfNeeded c
 
 -- | Inline a non-recursive function: bind the parameters to the actual values.
 inlineCall :: [Ident] -> Expr -> [Val] -> Build Val
@@ -1415,17 +1479,97 @@ tailLoop ps ts vals = do
            goScalar (tsBase ts)
   Scalar <$> valTagP res (last exitS)
 
--- | List consumer over a static stream as a backward loop over the tags.
-consumerLoop :: [Ident] -> ConsShape -> [Port] -> [Val] -> Build Val
-consumerLoop ps cs xs vals = do
+-- | List producer as a forward loop yielding a 'DStream'.
+producerLoop :: [Ident] -> ProdShape -> [Val] -> Build Val
+producerLoop ps pr vals = do
+  argv0 <- mapM asScalar vals
+  argv1 <- mapM guardIfNeeded argv0
+  inits <- alignExecInputs argv1
+  let ref = head inits
+  entry <- tagValP ref
+  j0    <- constFrom ref 0
+  let carried = inits ++ [entry, j0]
+  hdrs <- mapM (\_ -> newNode "loop_inctag" (NIncTag "")) carried
+  zipWithM_ (\h p -> connect p (InstPort h "0")) hdrs carried
+  let hps = map out0 hdrs
+      np  = length inits
+  tokH <- constFrom (head hps) 1
+  c <- inLoopCtx tokH $ withEnv $ do
+         zipWithM_ (\p h -> insertB p (BVal (Scalar h))) ps (take np hps)
+         goScalar (prCond pr) >>= boolify
+  steered <- mapM (steerP c) hps
+  let (contS, exitS) = unzip [ if prExitOnTrue pr then (f', t') else (t', f')
+                             | (t', f') <- steered ]
+      [entC, jC] = drop np contS
+      [entE, jE] = drop np exitS
+  tokC <- constFrom (head contS) 1
+  (el, nexts) <- inLoopCtx tokC $ withEnv $ do
+                   zipWithM_ (\p v -> insertB p (BVal (Scalar v))) ps (take np contS)
+                   e  <- goScalar (prElem pr)
+                   ns <- mapM goScalar (prArgs pr)
+                   pure (e, ns)
+  elA <- alignExecTo jC el
+  j'  <- addI jC 1
+  zipWithM_ (\h n -> connect n (InstPort h "0")) hdrs (nexts ++ [entC, j'])
+  cnt <- valTagP jE entE
+  pure (DStream cnt elA jC)
+
+-- | head of a DStream: element 0, moved to the owner tag t0.
+dsHead :: Val -> Build Port
+dsHead = \case
+  DStream _ e i -> do
+    z  <- constFrom i 0
+    is0 <- node2 "equal" (NEqual "") i z
+    (eT, _) <- steerP is0 e
+    incTagIP (-1) eT
+  v -> asScalar v
+
+-- | tail of a DStream: elements 1.. shifted down one tag, indices minus one.
+dsTail :: Val -> Build Val
+dsTail = \case
+  DStream c e i -> do
+    z   <- constFrom i 0
+    gt0 <- node2 "gthan" (NGThan "") i z
+    (eT, _) <- steerP gt0 e
+    (iT, _) <- steerP gt0 i
+    e' <- incTagIP (-1) eT
+    i0 <- incTagIP (-1) iT
+    i' <- subI i0 1
+    c' <- subI c 1
+    pure (DStream c' e' i')
+  v -> pure v
+
+-- | x : DStream, natively: new element at index 0, the rest shifted up.
+dsCons :: Port -> Val -> Build Val
+dsCons x = \case
+  DStream c e i -> do
+    xA <- alignExecTo c x
+    t0 <- tagValP c
+    t1 <- addI t0 1
+    x1 <- valTagP xA t1
+    z  <- constFrom c 0
+    z1 <- valTagP z t1
+    eUp <- incTagIP 1 e
+    iUp <- incTagIP 1 i >>= \p -> addI p 1
+    e' <- out0 <$> mergeP "dcons_elem" [x1, eUp]
+    i' <- out0 <$> mergeP "dcons_idx" [z1, iUp]
+    c' <- addI c 1
+    pure (DStream c' e' i')
+  v -> do p <- asScalar v; Scalar <$> pairEnc x p
+
+-- | List consumer as a backward loop over the tags; the list is either a
+-- static stream (Left payloads) or a DStream (Right (count, elements)).
+consumerLoop :: [Ident] -> ConsShape -> Either [Port] (Port, Port) -> [Val] -> Build Val
+consumerLoop ps cs src vals = do
   let j    = csIdx cs
-      n    = length xs
       invI = [ i | i <- [0 .. length ps - 1], i /= j ]
   invs0 <- mapM (\i -> asScalar (vals !! i)) invI
   invs1 <- mapM guardIfNeeded invs0
-  xs1   <- mapM guardIfNeeded xs
-  ins   <- alignExecInputs (invs1 ++ xs1)
-  let (invs, elems0) = splitAt (length invs1) ins
+  (statics, dyn) <- case src of
+    Left xs       -> do xs' <- mapM guardIfNeeded xs; pure (xs', Nothing)
+    Right (c, e)  -> do c' <- guardIfNeeded c; pure ([c'], Just e)
+  ins <- alignExecInputs (invs1 ++ statics)
+  let (invs, rest) = splitAt (length invs1) ins
   ref <- case ins of
            (r:_) -> pure r
            []    -> constI 0
@@ -1435,17 +1579,40 @@ consumerLoop ps cs xs vals = do
              zipWithM_ (\i v -> insertB (ps !! i) (BVal (Scalar v))) invI invs
              goScalar (csBase cs)
   baseA <- alignExecTo ref baseV
-  t0  <- tagValP ref
-  t1  <- addI t0 1                           -- tag of element 0
-  -- elements: element k at tag t0+1+k
-  elemPs <- forM (zip [0 ..] elems0) $ \(k, p) -> do
-              tk <- if k == 0 then pure t1 else addI t1 k
-              valTagP p tk
-  elemN <- if null elemPs then pure Nothing else Just <$> mergeP "loop_elem" elemPs
-  -- start values at tag t0+1+N
-  tN   <- addI t1 n
-  nP   <- constFrom ref n
-  starts <- mapM (\v -> valTagP v tN) (baseA : nP : invs)
+  (cnt, elems) <- case dyn of
+    Just e -> pure (head rest, Just e)
+    Nothing -> do
+      t0 <- tagValP ref
+      t1 <- addI t0 1
+      eps <- forM (zip [0 :: Int ..] rest) $ \(k, p) -> do
+               tk <- if k == 0 then pure t1 else addI t1 k
+               valTagP p tk
+      n  <- constFrom ref (length rest)
+      em <- if null eps then pure Nothing else Just . out0 <$> mergeP "loop_elem" eps
+      pure (n, em)
+  let step dInvs h acc = withEnv $ do
+        zipWithM_ (\i v -> insertB (ps !! i) (BVal (Scalar v))) invI dInvs
+        insertB recVar (BVal (Scalar acc))
+        case csHead cs of
+          Just hv -> insertB hv (BVal (Scalar h))
+          Nothing -> pure ()
+        goScalar (csBody cs)
+  Scalar <$> case elems of
+    Just e  -> backFold ref invs cnt e baseA step
+    Nothing -> pure baseA                       -- static [] : just the base
+
+-- | Backward fold over tag-indexed elements (element k at tag t0+1+k, with
+-- t0 the tag of @ref@): the accumulator starts as @base@ at tag t0+1+N and
+-- walks the tags down with inctagi -1, combining with the element found at
+-- each tag via @step@; a remaining-count (> 0 continues) is carried along,
+-- as are the loop invariants @invs@. The result comes back at tag t0.
+backFold :: Port -> [Port] -> Port -> Port -> Port
+         -> ([Port] -> Port -> Port -> Build Port) -> Build Port
+backFold ref invs cnt elems base step = do
+  t0 <- tagValP ref
+  t1 <- addI t0 1
+  tN <- bin2 "add" (NAdd "") t1 cnt
+  starts <- mapM (\v -> valTagP v tN) (base : cnt : invs)
   hdrs <- mapM (\p -> mergeP "loop_hdr" [p]) starts
   let hps = map out0 hdrs
       hR  = hps !! 1
@@ -1455,17 +1622,11 @@ consumerLoop ps cs xs vals = do
   decs <- mapM (incTagIP (-1) . fst) steered
   let (dAcc : dR : dInvs) = decs
   tokD <- constFrom dAcc 1
-  acc' <- inLoopCtx tokD $ withEnv $ do
-            zipWithM_ (\i v -> insertB (ps !! i) (BVal (Scalar v))) invI dInvs
-            insertB recVar (BVal (Scalar dAcc))
-            case (csHead cs, elemN) of
-              (Just h, Just en) -> insertB h (BVal (Scalar (out0 en)))
-              _                 -> pure ()
-            goScalar (csBody cs)
-  r' <- subI dR 1
+  acc' <- inLoopCtx tokD (step dInvs elems dAcc)
+  r'   <- subI dR 1
   zipWithM_ (\h p -> connect p (InstPort h "0")) hdrs (acc' : r' : dInvs)
-  -- exit (r == 0) happens at tag t0+1: move back to t0
-  Scalar <$> incTagIP (-1) (snd (head steered))
+  -- exit (count 0 left) happens at tag t0+1: move back to t0
+  incTagIP (-1) (snd (head steered))
 
 -- Literais -------------------------------------------------------------
 
@@ -1556,9 +1717,13 @@ compileCase scr alts = do
         taken0 <- constFrom pscr 0
         let alts' = [ (scalarPred pscr p, e) | (p, e) <- alts ]
         steerAlts taken0 alts'
-    Stream c _ -> do
-      -- Count is static: drop alternatives that cannot match and stop at
-      -- the first one that always matches.
+    _ -> do
+      -- Streams: drop alternatives that cannot match (static count) and stop
+      -- at the first one that always matches; dynamic ones test at runtime.
+      let c = case vscr of
+                Stream c0 _    -> c0
+                DStream c0 _ _ -> c0
+                Scalar p0      -> p0
       let classified = [ (p, e, staticMatch p (shapeOf vscr)) | (p, e) <- alts ]
           live       = cutAtYes [ a | a@(_, _, m) <- classified, m /= SMNo ]
       case live of
