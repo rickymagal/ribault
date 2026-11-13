@@ -17,17 +17,9 @@ This work proposes the translation of programs written in a Haskell subset into 
 |---|---|
 | `src/Analysis` | Parsing + analysis stages (Lexer/Parser/AST). |
 | `src/Synthesis` | Dataflow + TALM code generation. |
-| `test/` | Unit/integration test programs (`*.hsk`). |
-| `test/ast-output` | AST `.dot` generated from `analysis`. |
-| `test/ast-images` | AST `.png` rendered from `.dot`. |
-| `test/df-output` | Dataflow `.dot` generated from `synthesis`. |
-| `test/df-images` | Dataflow `.png` rendered from `.dot`. |
-| `test/talm` | TALM `.fl` generated from `codegen`. |
-| `test/supers/` | Per-program `Supers.hs` + `libsupers.so`. |
-| `scripts/` | Performance/correctness scripts. |
-| `tools/` | Supers build helpers, alias/fix scripts. |
+| `test/` | Unit test programs (`*.hss`); `make` renders AST/DF artifacts here (git-ignored). |
+| `tools/` | Supers build helpers + Haddock API docs builder (`build_module_docs.sh`). |
 | `external/TALM/` | Trebuchet interpreter + assembler (git submodule → [tiagoaoa/TALM](https://github.com/tiagoaoa/TALM), pinned). |
-| `build/` | GHC shim for RTS discovery. |
 
 ## Build / Targets
 
