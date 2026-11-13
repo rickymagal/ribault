@@ -69,7 +69,7 @@ CODE_FL      := $(patsubst $(TEST_DIR)/%.hss,$(CODE_OUT_DIR)/%.fl,$(TESTS))
 # ------------------------------------------------------------
 # Alvos de alto nível
 # ------------------------------------------------------------
-.PHONY: all examples df ast code tokens images ast-dots ast-images supers trebuchet clean
+.PHONY: all examples df ast code tokens images ast-dots ast-images supers trebuchet clean rocq
 
 all: $(EXE_RIBAULT) $(EXE_SUPERS) trebuchet
 
@@ -222,6 +222,9 @@ $(EXE_RIBAULT): $(LEXER_HS) $(PARSER_HS) $(SYNTAX_HS) $(SEMANTIC_HS) \
 # Compila o trebuchet (interpretador TALM)
 trebuchet:
 	$(MAKE) -C $(TALM_DIR)/interp
+
+rocq:
+	$(MAKE) -C rocq
 
 supers: supers_prepare $(EXE_SUPERS)
 	@mkdir -p $(SUPERS_DIR)

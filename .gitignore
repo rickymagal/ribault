@@ -48,3 +48,13 @@ test/supers/*/libsupers.so
 # benchmark results
 results/
 RESULTS/
+
+# Rocq/Coq build artifacts
+rocq/*.vo
+rocq/*.vok
+rocq/*.vos
+rocq/*.glob
+rocq/.*.aux
+rocq/Makefile.coq
+rocq/Makefile.coq.conf
+rocq/.Makefile.coq.d
