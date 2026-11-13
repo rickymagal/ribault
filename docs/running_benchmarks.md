@@ -20,7 +20,7 @@ bash scripts/run_all.sh /path/to/output
 
 - GHC (with packages: `parallel`, `deepseq`, `time`, `bytestring`)
 - Python 3
-- The TALM interpreter compiled at `TALM/interp/interp`
+- The TALM interpreter compiled at `external/TALM/interp/interp`
 - The `codegen` binary compiled at the repo root
 
 ## Default Parameters
@@ -183,7 +183,7 @@ NS="8" PS="1 2" REPS=1 \
 bash scripts/merge_sort_TALM_vs_Haskell/run_compare.sh \
   --start-N 500000 --step 500000 --n-max 5000000 \
   --reps 3 --procs "1,2,4,8" \
-  --interp TALM/interp/interp --asm-root TALM/asm --codegen . \
+  --interp external/TALM/interp/interp --asm-root external/TALM/asm --codegen . \
   --outroot ./results/mergesort --tag "ms"
 ```
 
@@ -194,8 +194,8 @@ bash scripts/merge_sort_TALM_vs_Haskell/run_compare.sh \
 | `--n-max` | Largest array size | `15000000` |
 | `--reps` | Repetitions per configuration | `3` |
 | `--procs` | Processors (comma-separated) | `"1,2,4,8,12,16,20"` |
-| `--interp` | Path to TALM interpreter | `TALM/interp/interp` |
-| `--asm-root` | Path to TALM assembler dir | `TALM/asm` |
+| `--interp` | Path to TALM interpreter | `external/TALM/interp/interp` |
+| `--asm-root` | Path to TALM assembler dir | `external/TALM/asm` |
 | `--codegen` | Path to repo root (contains `codegen`) | `.` |
 | `--outroot` | Output directory | `./results/mergesort` |
 | `--tag` | Tag for CSV filenames | `"ms"` |
@@ -218,7 +218,7 @@ MS_LEAF=array DF_LIST_BUILTIN=1 SUPERS_FORCE_PAR=1 MS_NPARTS=64 \
 bash scripts/merge_sort_TALM_vs_Haskell/run_compare.sh \
   --start-N 1000000 --step 1000000 --n-max 20000000 \
   --reps 5 --procs "1,2,4,8,12,16,20,24" \
-  --interp TALM/interp/interp --asm-root TALM/asm --codegen . \
+  --interp external/TALM/interp/interp --asm-root external/TALM/asm --codegen . \
   --outroot ./results/ms_heavy --tag "ms"
 
 # Only GHC (skip TALM)
@@ -226,7 +226,7 @@ SKIP_TALM=1 \
 bash scripts/merge_sort_TALM_vs_Haskell/run_compare.sh \
   --start-N 500000 --step 500000 --n-max 5000000 \
   --reps 3 --procs "1,2,4,8" \
-  --interp TALM/interp/interp --asm-root TALM/asm --codegen . \
+  --interp external/TALM/interp/interp --asm-root external/TALM/asm --codegen . \
   --outroot ./results/ms_ghc_only --tag "ms"
 ```
 
@@ -268,7 +268,7 @@ N_FILES=5 FILE_SIZE=1000 PS="1 2" REPS=1 \
 bash scripts/graph_coloring/run_compare.sh \
   --N "1000,5000" --reps 3 --procs "1,2,4,8,12,16,20" \
   --edge-prob 0.1 --seed 42 \
-  --interp TALM/interp/interp --asm-root TALM/asm --codegen . \
+  --interp external/TALM/interp/interp --asm-root external/TALM/asm --codegen . \
   --outroot ./results/gc_prob01 --tag "gc"
 ```
 
@@ -279,8 +279,8 @@ bash scripts/graph_coloring/run_compare.sh \
 | `--procs` | Processors (comma-separated) | `"1,2,4,8,12,16,20"` |
 | `--edge-prob` | Edge probability (graph density) | `0.1` |
 | `--seed` | Random seed for graph generation | `42` |
-| `--interp` | Path to TALM interpreter | `TALM/interp/interp` |
-| `--asm-root` | Path to TALM assembler dir | `TALM/asm` |
+| `--interp` | Path to TALM interpreter | `external/TALM/interp/interp` |
+| `--asm-root` | Path to TALM assembler dir | `external/TALM/asm` |
 | `--codegen` | Path to repo root | `.` |
 | `--outroot` | Output directory | `./results/gc` |
 | `--tag` | Tag for CSV filenames | `"gc"` |
@@ -302,7 +302,7 @@ for prob in 0.01 0.05 0.1 0.2 0.5; do
   bash scripts/graph_coloring/run_compare.sh \
     --N "1000,5000,10000" --reps 3 --procs "1,2,4,8,12,16,20" \
     --edge-prob "$prob" --seed 42 \
-    --interp TALM/interp/interp --asm-root TALM/asm --codegen . \
+    --interp external/TALM/interp/interp --asm-root external/TALM/asm --codegen . \
     --outroot "./results/gc/$tag" --tag "$tag"
 done
 
@@ -310,7 +310,7 @@ done
 bash scripts/graph_coloring/run_compare.sh \
   --N "5000,10000" --reps 5 --procs "1,2,4,8,16,20" \
   --edge-prob 0.5 --seed 42 \
-  --interp TALM/interp/interp --asm-root TALM/asm --codegen . \
+  --interp external/TALM/interp/interp --asm-root external/TALM/asm --codegen . \
   --outroot ./results/gc_dense --tag "gc_dense"
 ```
 

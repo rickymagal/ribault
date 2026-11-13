@@ -1,0 +1,3 @@
+[submodule "external/TALM"]
+	path = external/TALM
+	url = https://github.com/tiagoaoa/TALM

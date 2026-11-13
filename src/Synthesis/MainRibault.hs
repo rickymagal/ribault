@@ -2,7 +2,7 @@
 
 module Main where
 
-import System.Environment  (getArgs, getExecutablePath)
+import System.Environment  (getArgs, getExecutablePath, lookupEnv)
 import System.IO           (hPutStrLn, stderr)
 import System.Exit         (exitFailure, exitWith, ExitCode(..))
 import System.FilePath     (takeBaseName, takeDirectory, (</>))
@@ -31,6 +31,7 @@ main = do
       buildDir = "build" </> baseName
 
   createDirectoryIfMissing True buildDir
+  talmDir <- maybe (repoRoot </> "external" </> "TALM") id <$> lookupEnv "TALM_DIR"
 
   -- 1. Codegen: .hss → .fl
   src <- readFile file
@@ -56,14 +57,14 @@ main = do
 
   -- 3. FlowASM: .fl → .flb + .pla
   run "flowasm" "python3"
-    [ repoRoot </> "TALM" </> "asm" </> "assembler.py"
+    [ talmDir </> "asm" </> "assembler.py"
     , "-n", show nPEs
     , flFile
     , "-o", buildDir </> baseName
     ]
 
   -- 4. Trebuchet: executar
-  let interp = repoRoot </> "TALM" </> "interp" </> "interp"
+  let interp = talmDir </> "interp" </> "interp"
   absLib <- makeAbsolute (buildDir </> "libsupers.so")
   ec <- rawSystem interp $
     [ show nPEs

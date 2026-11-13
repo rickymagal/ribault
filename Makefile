@@ -5,6 +5,7 @@ GHC         := ghc
 ALEX        := alex
 HAPPY       := happy
 DOT         := dot
+TALM_DIR ?= external/TALM
 
 # -------- pastas ------------------------------------------------
 SRC_DIR     := src
@@ -220,7 +221,7 @@ $(EXE_RIBAULT): $(LEXER_HS) $(PARSER_HS) $(SYNTAX_HS) $(SEMANTIC_HS) \
 
 # Compila o trebuchet (interpretador TALM)
 trebuchet:
-	$(MAKE) -C TALM/interp
+	$(MAKE) -C $(TALM_DIR)/interp
 
 supers: supers_prepare $(EXE_SUPERS)
 	@mkdir -p $(SUPERS_DIR)
@@ -241,6 +242,7 @@ supers: supers_prepare $(EXE_SUPERS)
 	 PY_FIX="tools/fix_execstack.py" \
 	 GMP_CANDIDATES='$(GMP_CANDIDATES)' \
 	 TESTS='$(TESTS)' \
+	 TALM_DIR="$(TALM_DIR)" \
 	 bash tools/build_supers.sh
 
 

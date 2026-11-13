@@ -26,13 +26,21 @@ This work proposes the translation of programs written in a Haskell subset into 
 | `test/supers/` | Per-program `Supers.hs` + `libsupers.so`. |
 | `scripts/` | Performance/correctness scripts. |
 | `tools/` | Supers build helpers, alias/fix scripts. |
-| `TALM/` | Trebuchet interpreter + assembler (vendored). |
+| `external/TALM/` | Trebuchet interpreter + assembler (git submodule → [tiagoaoa/TALM](https://github.com/tiagoaoa/TALM), pinned). |
 | `build/` | GHC shim for RTS discovery. |
 
 ## Build / Targets
 
 Prerequisites: `ghc`, `alex`, `happy`, `dot` (Graphviz), `python3`, `gcc`.
-The TALM interpreter/assembler is under `TALM/`.
+The TALM interpreter/assembler is the `external/TALM` git submodule
+([tiagoaoa/TALM](https://github.com/tiagoaoa/TALM), pinned by SHA). Initialize it
+before building:
+
+```bash
+git submodule update --init external/TALM
+```
+
+`TALM_DIR` overrides the path (default: `external/TALM`), e.g. `make TALM_DIR=/path/to/TALM`.
 
 ```bash
 # Build everything for test programs
@@ -75,10 +83,10 @@ tools/build_supers.sh /path/to/myprog.hsk /tmp/myprog_supers/Supers.hs
 
 ## Running on TALM (Trebuchet)
 
-The TALM path can vary per user. Use `TALM_DIR`:
+`TALM_DIR` points at the TALM checkout (default: `external/TALM`; set it to use another one):
 
 ```bash
-TALM_DIR=/path/to/TALM
+TALM_DIR=external/TALM
 P=8
 
 # Assemble
