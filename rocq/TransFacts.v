@@ -209,3 +209,63 @@ Proof.
       apply in_app_iff in H as [H|H]; [apply Hex2 in H | apply Hex1 in H]; lia.
   - inversion Htr; subst. apply leaf_fresh; assumption.
 Qed.
+
+(* FUEL MONOTONICITY: more fuel preserves an Ok result.
+   Needed to synchronise the two sub-fuels at a two-input node
+   (EBin) in the agreement theorem. *)
+Lemma eval_dfg_fuel_mono : forall fd g denv m p v,
+  eval_dfg fd g denv m p = Ok v ->
+  forall fd', fd <= fd' -> eval_dfg fd' g denv m p = Ok v.
+Proof.
+  induction fd as [|fd IH]; intros g denv m p v H fd' Hle.
+  - cbn in H. discriminate.
+  - destruct fd' as [|fd']; [lia|].
+    assert (Hle' : fd <= fd') by lia.
+    cbn [eval_dfg] in H |- *. cbv zeta in H |- *.
+    destruct (lookup_node (dnodes g) m) as [nd|]; [| discriminate H].
+    destruct nd; cbn in H |- *; try exact H;
+    repeat match type of H with
+      | context [feeder ?E ?M ?P] =>
+          let Ef := fresh "Ef" in
+          destruct (feeder E M P) as [[? ?]|] eqn:Ef; cbn in H |- *;
+          [| discriminate H]
+      | context [eval_dfg fd ?G ?D ?S ?SP] =>
+          let Es := fresh "Es" in
+          destruct (eval_dfg fd G D S SP) eqn:Es; cbn in H; try discriminate H;
+          rewrite (IH _ _ _ _ _ Es fd' Hle'); cbn
+      end; exact H.
+Qed.
+
+(* ENVIRONMENT INVARIANT on the graph (ns,es), relating rho/denv to senv:
+   - free variable (clookup None): senv and denv agree on it;
+   - let-bound variable (clookup Some i): node i computes the value
+     senv holds for it (for some fuel). *)
+Definition env_inv (rho : cenv) (senv denv : venv)
+                   (ns : list (nodeid * node))
+                   (es : list (nodeid * portid * nodeid * portid)) : Prop :=
+  (forall x, clookup rho x = None -> vlookup senv x = vlookup denv x)
+  /\ (forall x i, clookup rho x = Some i ->
+        exists v fd, vlookup senv x = Some v
+                  /\ eval_dfg fd {| dnodes := ns; dedges := es |} denv i "0" = Ok v).
+
+(* TRANSPORT: the invariant survives prepending fresh nodes/edges.
+   Direct application of eval_dfg_extend at the bound nodes (all < b). *)
+Lemma env_inv_mono : forall rho senv denv ns es ns_ex es_ex b,
+  cenv_below rho b ->
+  edges_below es b ->
+  (forall i nd, In (i, nd) ns_ex -> b <= i) ->
+  (forall s sp t tp, In (s, sp, t, tp) es_ex -> b <= t) ->
+  env_inv rho senv denv ns es ->
+  env_inv rho senv denv (ns_ex ++ ns) (es_ex ++ es).
+Proof.
+  intros rho senv denv ns es ns_ex es_ex b Hc Heb Hnx Hex [Hfree Hbound].
+  split.
+  - exact Hfree.
+  - intros x i Hcl.
+    destruct (Hbound x i Hcl) as [v [fd [Hv Hev]]].
+    exists v, fd. split; [exact Hv|].
+    assert (Hi : i < b).
+    { unfold cenv_below in Hc. apply (Hc x i). apply clookup_in. exact Hcl. }
+    rewrite <- (eval_dfg_extend fd ns_ex es_ex ns es denv b Heb Hnx Hex i "0" Hi).
+    exact Hev.
+Qed.
