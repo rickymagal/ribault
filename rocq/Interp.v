@@ -5,13 +5,14 @@ Local Open Scope Z_scope.
 
 Inductive value : Type := VInt (n : Z) | VBool (b : bool).
 
-Inductive result (A : Type) : Type := Ok (a : A) | Err | TimeOut.
+Inductive result (A : Type) : Type := Ok (a : A) | Err | Abort | TimeOut.
 Arguments Ok {A} a.
 Arguments Err {A}.
+Arguments Abort {A}.
 Arguments TimeOut {A}.
 
 Definition rbind {A B} (r : result A) (f : A -> result B) : result B :=
-  match r with Ok a => f a | Err => Err | TimeOut => TimeOut end.
+  match r with Ok a => f a | Err => Err | Abort => Abort | TimeOut => TimeOut end.
 Notation "x <- e1 ;; e2" := (rbind e1 (fun x => e2))
   (right associativity, at level 60).
 
@@ -41,8 +42,8 @@ Definition eval_bin (o : binop) (v1 v2 : value) : result value :=
   | OAdd, VInt a, VInt b => Ok (VInt (a + b))
   | OSub, VInt a, VInt b => Ok (VInt (a - b))
   | OMul, VInt a, VInt b => Ok (VInt (a * b))
-  | ODiv, VInt a, VInt b => if Z.eqb b 0 then Err else Ok (VInt (Z.quot a b))
-  | OMod, VInt a, VInt b => if Z.eqb b 0 then Err else Ok (VInt (Z.rem a b))
+  | ODiv, VInt a, VInt b => if Z.eqb b 0 then Abort else Ok (VInt (Z.quot a b))
+  | OMod, VInt a, VInt b => if Z.eqb b 0 then Abort else Ok (VInt (Z.rem a b))
   | OEq,  VInt a, VInt b => Ok (VBool (Z.eqb a b))
   | OEq,  VBool a,VBool b=> Ok (VBool (Bool.eqb a b))
   | ONe,  VInt a, VInt b => Ok (VBool (negb (Z.eqb a b)))
