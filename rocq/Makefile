@@ -3,7 +3,7 @@ COQMAKEFILE := $(shell command -v rocq >/dev/null 2>&1 && echo "rocq makefile" |
 all: Makefile.coq
 	$(MAKE) -f Makefile.coq
 
-Makefile.coq: _CoqProject Syntax.v Interp.v Typing.v Safety.v Dfg.v
+Makefile.coq: _CoqProject Syntax.v Interp.v Typing.v Safety.v Dfg.v Trans.v
 	$(COQMAKEFILE) -f _CoqProject -o Makefile.coq
 
 clean:
