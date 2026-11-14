@@ -75,7 +75,7 @@ import Analysis.Lexer (Token(..))
 Program :: { Program }
     : DeclList                      { Program (reverse $1) }
 
--- DeclList: declarações separadas por ';' (com trailing opcional)
+-- DeclList: declarations separated by ';' (optional trailing one)
 DeclList :: { [Decl] }
     : Decl DeclRest                 { $1 : $2 }
 
@@ -102,7 +102,7 @@ Expr :: { Expr }
 Lambda :: { Expr }
     : "\\" LamParams "->" Expr      { Lambda $2 $4 }
 
--- parâmetros de lambda: ou vários ident ou um (x1,x2,…)
+-- lambda parameters: either several idents or one (x1,x2,...)
 LamParams :: { [Ident] }
     : Params                        { $1 }
     | "(" IdentList ")"             { $2 }
@@ -140,7 +140,7 @@ DeclBlockEnd :: { () }
     :                               { () }
     | "layout_end"                  { () }
 
--- expressões binárias, sem rec. à esquerda
+-- binary expressions, without left recursion
 
 ExprOr :: { Expr }
     : ExprAnd OrRest               { foldl (BinOp Or) $1 $2 }
@@ -198,7 +198,7 @@ ExprUnary :: { Expr }
     | "-" ExprUnary                { UnOp Neg $2 }
     | ExprApp                      { $1 }
 
--- aplicação n-ária
+-- n-ary application
 ExprApp :: { Expr }
     : Atom AppTail  %prec APP      { foldl App $1 $2 }
 AppTail :: { [Expr] }
@@ -250,7 +250,7 @@ TupleTail :: { [Expr] }
     :                              { [] }
     | "," Expr TupleTail           { $2 : $3 }
 
--- padrões
+-- patterns
 
 Pattern :: { Pattern }
     : "_"                          { PWildcard }

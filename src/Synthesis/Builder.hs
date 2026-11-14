@@ -41,12 +41,12 @@ import           Port                   (Port(..), (-->))
 import           Unique                 (Unique, evalUnique, freshId)
 import           Node                   (DNode(..), out1Port)
 
--- Grafo final
+-- Final graph
 
 -- | Final dataflow graph specialized to 'DNode'.
 type DFG = DGraph DNode
 
--- Ambiente
+-- Environment
 
 -- | Synthesized value of an expression.
 --
@@ -107,7 +107,7 @@ newtype Build a = Build { unBuild :: StateT BuildS Unique a }
 runBuild :: Build a -> (a, BuildS)
 runBuild m = evalUnique (runStateT (unBuild m) emptyS)
 
--- escopo ----------------------------------------------------------------
+-- scope -----------------------------------------------------------------
 
 -- | Push a fresh environment onto the stack.
 pushEnv, popEnv :: Build ()
@@ -273,7 +273,7 @@ updateB x b = Build $ modify $ \s -> s { bsEnv = go (bsEnv s) }
       | M.member x e = M.insert x b e : rs
       | otherwise     = e : go rs
 
--- marcação de função float ---------------------------------------------
+-- float function marking -----------------------------------------------
 
 -- | Mark a function as having been used in a floating-point context.
 markFloatFun :: Ident -> Build ()
@@ -303,7 +303,7 @@ isListActive = Build $ gets $ \s -> case bsActive s of
   (f:_) -> S.member f (bsListFuns s)
   _     -> False
 
--- helper: está construindo 'f' agora?
+-- helper: is 'f' being built right now?
 
 -- | Is a given function currently being built (in the active stack)?
 isActiveFun :: Ident -> Build Bool
@@ -367,7 +367,7 @@ connectPlus src dst = Build $ do
       allPs = src : alts
   put s { bsGraph = foldr (\p g -> addEdge (p --> dst) g) (bsGraph s) allPs }
 
--- nós ------------------------------------------------------------------
+-- nodes ----------------------------------------------------------------
 
 -- | Create a new node with label and payload, returning its 'NodeId'.
 newNode :: String -> DNode -> Build NodeId
@@ -435,7 +435,7 @@ setName l n = case n of
   NArg{}      -> n{ nName = l }
   NSuper{}    -> n{ nName = l }
 
--- codificação pares/listas ---------------------------------------------
+-- pair/list encoding --------------------------------------------------
 
 -- Builtin supers reserved in Semantic: s0..s3
 builtinListCons :: Int
@@ -509,7 +509,7 @@ constFrom ref k = do
       let z = out0 subN
       if k == 0 then pure z else addI z k
 
--- immediates (sem aliases!)
+-- immediates (no aliases!)
 
 -- | Add immediate @k@ to input (no alias expansion).
 addI :: Port -> Int -> Build Port
@@ -542,7 +542,7 @@ fnegP p = do
   connect p (InstPort nid "0")
   pure (out0 nid)
 
--- fmuli helper (sem aliases!)
+-- fmuli helper (no aliases!)
 
 -- | Port representing the empty list.
 nilP :: Build Port
@@ -622,7 +622,7 @@ foldrM' f z0 = go
     go (y:ys) = do r <- go ys
                    f y r
 
--- streams estáticos ------------------------------------------------------
+-- static streams --------------------------------------------------------
 
 -- | Re-encode a value in the legacy pair encoding (list boundary).
 streamToPair :: Val -> Build Port
@@ -758,7 +758,7 @@ buildProgram p0 =
       connectPlus p (InstPort r "0")
     buildZero _ = pure ()
 
--- função já construída?
+-- function already built?
 
 -- | Has a return node for the given function @f@ already been emitted?
 funBuilt :: Ident -> Build Bool
@@ -787,7 +787,7 @@ retNamed nm = Build $ do
       put s { bsGraph = g' }
       pure nid
 
--- evita reentrada recursiva
+-- avoid recursive re-entry
 
 -- | Ensure a function @f@ is built at most once; guard against recursion.
 ensureBuilt :: Ident -> [Ident] -> Expr -> Build ()
@@ -828,7 +828,7 @@ ensureBuilt f ps body = do
        Build $ modify (\s -> s { bsInLoop = inLoop0 })
        pure ()
 
--- variável livre -> NArg
+-- free variable -> NArg
 
 -- | Treat an unbound variable as a free 'NArg' input node.
 freeVar :: Ident -> Build Port
@@ -838,7 +838,7 @@ freeVar x = do
   insertB x (BVal (Scalar p))
   pure p
 
--- detecta se um Port carrega float (por origem)
+-- detect whether a Port carries a float (by origin)
 
 -- | Heuristically check if a port originates from floating-point ops/values.
 -- Traces back through tag-management nodes (NIncTagI, NValTag, NAddI, NArg)
@@ -914,7 +914,7 @@ isFloatContext a b = do
   pb <- portIsFloat b
   pure (af || pa || pb)
 
--- Expressões -----------------------------------------------------------
+-- Expressions ----------------------------------------------------------
 
 -- | Synthesize an expression into the graph and return its 'Val'.
 goExpr :: Expr -> Build Val
@@ -970,7 +970,7 @@ goExpr = \case
         registerAlias outT [outF]
         pure (Scalar outT)
 
-  -- listas / tuplas: stream estático nativo (length-prefix)
+  -- lists / tuples: native static stream (length-prefix)
   Cons a b -> do
     pa <- goScalar a
     vb <- goExpr b
@@ -1049,7 +1049,7 @@ staticStream xs = do
   c  <- constI (length ps)
   pure (Stream c ps)
 
--- Declarações ----------------------------------------------------------
+-- Declarations ---------------------------------------------------------
 
 -- | Insert a function lambda into the environment.
 goDecl :: Decl -> Build ()
@@ -1057,7 +1057,7 @@ goDecl (FunDecl f ps body) = do
   Build $ modify (\s -> s { bsLocalFuns = S.insert f (bsLocalFuns s) })
   insertB f (BLam ps body)
 
--- Aplicação n-ária -----------------------------------------------------
+-- N-ary application ---------------------------------------------------
 
 -- | Flatten nested applications into @(head, args)@.
 flattenApp :: Expr -> (Expr, [Expr])
@@ -1079,7 +1079,7 @@ withActive f m = Build $ do
   put s'{ bsActive = tail (bsActive s'), bsScopeK = oldK }
   pure r
 
--- taskId determinístico
+-- deterministic taskId
 
 -- | Deterministic task identifier derived from the function name.
 funTaskId :: Ident -> Int
@@ -1115,7 +1115,7 @@ syncArgs argv = case argv of
 callgroupPort :: NodeId -> String
 callgroupPort cg = "cg" ++ show cg ++ "_"
 
--- nó de argumento formal
+-- formal argument node
 
 -- | Ensure the formal argument node @fun#i@ exists and return its output port.
 argNode :: String -> Int -> Build Port
@@ -1140,7 +1140,7 @@ namedArg nm = Build $ do
              pure nid'
   pure (out0 nid)
 
--- formal + alias para o real
+-- formal + alias to the actual argument
 
 -- | Apply a function or lambda to argument expressions.
 goApp :: Expr -> [Expr] -> Build Val
@@ -1230,7 +1230,7 @@ talmCallPlain f vals = do
     connectPlus (out0 rs) (InstPort retN "1")
     pure (Scalar (InstPort retN (callgroupPort cg)))
 
--- Laços nativos (recursão linear) ----------------------------------------
+-- Native loops (linear recursion) ---------------------------------------
 --
 -- A call to a top-level function whose body is a linear self-recursion is
 -- lowered at the call site to a TALM loop instead of a chain of calls:
@@ -2118,7 +2118,7 @@ listFree tys = go
       PTuple qs -> all patOK qs
       _         -> True
 
--- Literais -------------------------------------------------------------
+-- Literals -------------------------------------------------------------
 
 -- | Build a constant for a 'Literal'.
 litNode :: Literal -> Build Port
@@ -2260,7 +2260,7 @@ compileCase scr alts = do
                 []       -> Scalar <$> falseP
     -- Each alternative: its guard (pattern matched and no earlier one taken)
     -- and its value built under that guard.
-    -- Última alternativa: NÃO compute orP/taken' (evita nó morto).
+    -- Last alternative: do NOT compute orP/taken' (avoids a dead node).
     goAlts _     []              acc _maxK = pure (reverse acc)
     goAlts taken [(mkPred,e)]    acc _maxK = do
       (_pPred, binds, guardi) <- withNoGuard $ do
@@ -2279,7 +2279,7 @@ compileCase scr alts = do
       Build $ modify (\s -> s { bsScopeK = max (max _maxK kAfter) baseK })
       pure (reverse ((guardi, v):acc))
 
-    -- Alternativas intermediárias: mantém o cálculo de taken'
+    -- Intermediate alternatives: keep computing taken'
     goAlts taken ((mkPred,e):rs) acc maxK0 = do
       (_pPred, binds, guardi, taken') <- withNoGuard $ do
         (pp0, bs) <- mkPred

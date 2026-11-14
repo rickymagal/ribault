@@ -1,5 +1,5 @@
 # ------------------------------------------------------------
-# Ribault – Makefile com df, ast e libsupers
+# Ribault – Makefile with df, ast and libsupers
 # ------------------------------------------------------------
 GHC         := ghc
 ALEX        := alex
@@ -7,18 +7,18 @@ HAPPY       := happy
 DOT         := dot
 TALM_DIR ?= external/TALM
 
-# -------- pastas ------------------------------------------------
+# -------- directories -------------------------------------------
 SRC_DIR     := src
 TEST_DIR    := test
 
-# Saídas
+# Outputs
 DF_OUT_DIR   := $(TEST_DIR)/df-output
 DF_IMG_DIR   := $(TEST_DIR)/df-images
 AST_OUT_DIR  := $(TEST_DIR)/ast-output
 AST_IMG_DIR  := $(TEST_DIR)/ast-images
 CODE_OUT_DIR := $(TEST_DIR)/talm
 
-# -------- fontes -----------------------------------------------
+# -------- sources ----------------------------------------------
 LEXER_SRC    := $(SRC_DIR)/Analysis/Lexer.x
 PARSER_SRC   := $(SRC_DIR)/Analysis/Parser.y
 LEXER_HS     := $(SRC_DIR)/Analysis/Lexer.hs
@@ -47,14 +47,14 @@ SUPERS_DIR     := $(TEST_DIR)/supers
 MAIN_RIBAULT_HS := $(SRC_DIR)/Synthesis/MainRibault.hs
 EXE_RIBAULT     := ribault
 
-# -------- executáveis -----------------------------------------
+# -------- executables ---------------------------------------
 EXE_DF       := synthesis
 EXE_AST      := analysis
 EXE_CODE     := codegen
 
 SHELL := /bin/bash
 # ============================================================
-# Casos de teste
+# Test cases
 # ============================================================
 TESTS        := $(wildcard $(TEST_DIR)/*.hss)
 
@@ -67,7 +67,7 @@ AST_IMGS     := $(patsubst $(AST_OUT_DIR)/%.dot,$(AST_IMG_DIR)/%.png,$(AST_DOTS)
 CODE_FL      := $(patsubst $(TEST_DIR)/%.hss,$(CODE_OUT_DIR)/%.fl,$(TESTS))
 
 # ------------------------------------------------------------
-# Alvos de alto nível
+# High-level targets
 # ------------------------------------------------------------
 .PHONY: all examples df ast code tokens images ast-dots ast-images supers trebuchet clean rocq
 
@@ -84,7 +84,7 @@ SUPERS_WRAPPERS_MAX ?= 256
 .PHONY: supers_prepare
 supers_prepare:
 	@set -eu
-	@echo "[shim] preparando GHC shim em $(SHIM_DIR)"
+	@echo "[shim] preparing GHC shim in $(SHIM_DIR)"
 	@mkdir -p "$(SHIM_DIR)/rts"
 	@RTS_DIR="$$(ghc-pkg field rts library-dirs --simple-output)"; \
 	BASE_DIR="$$(dirname "$$RTS_DIR")"; \
@@ -117,8 +117,8 @@ supers_prepare:
 	  RTS_SO="$$(ls "$$RTS_DIR"/libHSrts*ghc$(GHC_VER).so 2>/dev/null | head -n1)"; \
 	fi; \
 	test -n "$$RTS_SO" || { \
-	  echo "[shim] ERRO: não achei libHSrts*ghc$(GHC_VER).so"; \
-	  echo "       Procurei em:"; \
+	  echo "[shim] ERROR: could not find libHSrts*ghc$(GHC_VER).so"; \
+	  echo "       Searched in:"; \
 	  echo "         $$BASE_DIR"; \
 	  echo "         $$RTS_DIR"; \
 	  exit 2; \
@@ -141,7 +141,7 @@ supers_prepare:
 
 
 
-# ---------- biblioteca de super-instruções --------------------
+# ---------- super-instruction library ------------------------
 
 GHC_RTS_DIR := $(GHC_LIBDIR)/rts
 # ----- GHC base ------------------------------------------------
@@ -151,15 +151,15 @@ RTS_LIBDIR      := $(shell ghc-pkg field rts library-dirs --simple-output)
 RTS_INCDIRS     := $(shell ghc-pkg field rts include-dirs --simple-output)
 FEDORA_GHC_BASE := $(dir $(RTS_LIBDIR))                   # .../lib/x86_64-linux-ghc-9.6.6/
 
-# ----- Shim local (sem sudo) ----------------------------------
+# ----- Local shim (no sudo) -----------------------------------
 GHC_SHIM_DIR := build/ghc-shim
-GHC_LIBDIR_SHIM := $(GHC_SHIM_DIR)                        # será passado ao script
+GHC_LIBDIR_SHIM := $(GHC_SHIM_DIR)                        # passed to the script
 GHC_RTS_DIR  := $(GHC_LIBDIR_SHIM)/rts
 
-# Includes do RTS (p/ HsFFI.h etc)
+# RTS includes (for HsFFI.h etc)
 CPP_RTS_INCS := $(foreach d,$(RTS_INCDIRS),-I$(d))
 
-# Tudo que a .so pode pedir (cobre layout clássico e Fedora)
+# Everything the .so may need (covers classic and Fedora layouts)
 ifeq ($(GHC_MAJOR),8)
   SUPERS_BIGNUM_PKG :=
   SUPERS_BIGNUM_PATTERN :=
@@ -176,10 +176,10 @@ DEPS_PATTERNS := \
   integer-gmp-*/libHSinteger-gmp-*.so \
   $(SUPERS_BIGNUM_PATTERN)
 
-# (Opcional) libgmp para runtime fechado
+# (Optional) libgmp for a self-contained runtime
 GMP_CANDIDATES := /usr/lib64/libgmp.so.10 /usr/lib/libgmp.so.10
 
-# Link sem -threaded (evita *_thr); força noexecstack e rpath curto no bundle local
+# Link without -threaded (avoids *_thr); forces noexecstack and a short rpath in the local bundle
 SUPERS_LINK_FLAGS := -O2 -shared -dynamic -fPIC -no-hs-main \
                      -hide-all-packages \
                      -package base -package ghc-prim -package integer-gmp $(SUPERS_BIGNUM_PKG) \
@@ -189,7 +189,7 @@ SUPERS_LINK_FLAGS := -O2 -shared -dynamic -fPIC -no-hs-main \
                      -optl -Wl,-rpath,'$$ORIGIN/ghc-deps:$$ORIGIN' \
                      -optl -Wl,--no-as-needed
 
-# Compila o gerador de supers (supersgen)
+# Build the supers generator (supersgen)
 $(EXE_SUPERS): $(LEXER_HS) $(PARSER_HS) $(SYNTAX_HS) $(SEMANTIC_HS) \
                $(UNIQUE_HS) $(TYPES_HS) $(PORT_HS) $(NODE_HS) \
                $(SUPERS_EXTRACT) $(SUPERS_EMIT) $(MAIN_SUPERS_HS)
@@ -204,7 +204,7 @@ $(EXE_SUPERS): $(LEXER_HS) $(PARSER_HS) $(SYNTAX_HS) $(SEMANTIC_HS) \
 	  $(SUPERS_EXTRACT) $(SUPERS_EMIT)
 	@chmod +x $@
 
-# Compila o driver unificado (ribault)
+# Build the unified driver (ribault)
 $(EXE_RIBAULT): $(LEXER_HS) $(PARSER_HS) $(SYNTAX_HS) $(SEMANTIC_HS) \
                 $(BUILDER_HS) $(CODEGEN_HS) $(UNIQUE_HS) \
                 $(TYPES_HS) $(PORT_HS) $(NODE_HS) $(MAIN_RIBAULT_HS)
@@ -219,7 +219,7 @@ $(EXE_RIBAULT): $(LEXER_HS) $(PARSER_HS) $(SYNTAX_HS) $(SEMANTIC_HS) \
 	  $(TYPES_HS) $(PORT_HS) $(NODE_HS)
 	@chmod +x $@
 
-# Compila o trebuchet (interpretador TALM)
+# Build trebuchet (the TALM interpreter)
 trebuchet:
 	$(MAKE) -C $(TALM_DIR)/interp
 
@@ -263,7 +263,7 @@ ast-images: $(AST_IMGS)
 code: $(CODE_FL)  
 
 # ------------------------------------------------------------
-# Geração de Lexer / Parser
+# Lexer / Parser generation
 # ------------------------------------------------------------
 $(LEXER_HS): $(LEXER_SRC)
 	@echo "[ALEX ] $<"
@@ -274,7 +274,7 @@ $(PARSER_HS): $(PARSER_SRC)
 	$(HAPPY) --ghc -o $@ $<
 
 # ------------------------------------------------------------
-# Compilação executáveis
+# Executable compilation
 # ------------------------------------------------------------
 $(EXE_DF): $(LEXER_HS) $(PARSER_HS) $(SYNTAX_HS) $(SEMANTIC_HS) \
            $(BUILDER_HS) $(GRAPHVIZ_HS) $(MAIN_DF_HS) $(UNIQUE_HS) \
@@ -346,9 +346,9 @@ $(CODE_OUT_DIR)/%.fl: $(TEST_DIR)/%.hss | $(EXE_CODE)
 	@echo "[TALM ] $< → $@"
 	./$(EXE_CODE) $< > $@
 
-# limpeza
+# cleanup
 clean:
-	@echo "Limpeza completa."
+	@echo "Clean complete."
 	@rm -rf synthesis.obj synthesis.hi \
 	        analysis.obj analysis.hi   \
 	        codegen.obj codegen.hi     \

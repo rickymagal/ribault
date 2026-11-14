@@ -136,7 +136,7 @@ checkExpr sig env expr = case expr of
         env'   = Set.union env (Set.fromList (fnames ++ params))
     in errsDecl ++ checkExpr sig env' body
   App{} ->
-    -- Só checamos recursivamente; NÃO emitimos mais ArityMismatch aqui.
+    -- Only check recursively; ArityMismatch is no longer emitted here.
     let (fn0,args) = flattenApp expr
         eFn = checkExpr sig env fn0
         eAs = concatMap (checkExpr sig env) args

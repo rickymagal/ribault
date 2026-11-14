@@ -47,7 +47,7 @@ main = do
   TLIO.writeFile flFile flText
   info (file ++ " -> " ++ flFile)
 
-  -- 2. Supers: gerar e compilar libsupers.so
+  -- 2. Supers: generate and compile libsupers.so
   let supersHs = buildDir </> "Supers.hs"
   run "build_supers" "bash"
     [ repoRoot </> "tools" </> "build_supers.sh"
@@ -67,7 +67,7 @@ main = do
   let plaFile = buildDir </> (baseName ++ ".pla")
   pes <- placePEs nPEs plaFile
 
-  -- 5. Trebuchet: executar
+  -- 5. Trebuchet: run
   let interp = talmDir </> "interp" </> "interp"
   absLib <- makeAbsolute (buildDir </> "libsupers.so")
   ec <- rawSystem interp $

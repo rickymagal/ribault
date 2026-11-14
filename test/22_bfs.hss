@@ -1,7 +1,7 @@
--- Grafo de exemplo: lista de pares (vértice, lista de vizinhos)
+-- Example graph: list of pairs (vertex, list of neighbours)
 graph = [(1,[2,3]), (2,[4]), (3,[4,5]), (4,[]), (5,[])]
 
--- lookupGraph: dado um grafo e um nó, retorna sua lista de vizinhos
+-- lookupGraph: given a graph and a node, return its list of neighbours
 lookupGraph g x = case g of
   []               -> []
 
@@ -10,7 +10,7 @@ lookupGraph g x = case g of
       then vs
       else lookupGraph rest x
 
--- elem: testa se x está em xs
+-- elem: test whether x is in xs
 elem x xs = case xs of
   []      -> False
 
@@ -19,13 +19,13 @@ elem x xs = case xs of
       then True
       else elem x ys
 
--- append: concatena duas listas
+-- append: concatenate two lists
 append xs ys = case xs of
   []      -> ys
 
   (z:zs)  -> z : append zs ys
 
--- filterNotVisited: mantém só os vizinhos não visitados
+-- filterNotVisited: keep only the unvisited neighbours
 filterNotVisited xs visited = case xs of
   []      -> []
 
@@ -34,7 +34,7 @@ filterNotVisited xs visited = case xs of
       then filterNotVisited zs visited
       else z : filterNotVisited zs visited
 
--- bfsRec: (fila de nós) e (lista de visitados)
+-- bfsRec: (queue of nodes) and (list of visited nodes)
 bfsRec queue visited = case queue of
   []      -> visited
 
@@ -45,8 +45,8 @@ bfsRec queue visited = case queue of
     let visited' = append visited news in
     bfsRec queue' visited'
 
--- bfs: inicia a BFS a partir de um nó
+-- bfs: start the BFS from a node
 bfs start = bfsRec [start] [start]
 
--- main: executa bfs a partir de 1
+-- main: run bfs starting from 1
 main = bfs 1

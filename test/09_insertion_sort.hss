@@ -1,6 +1,6 @@
--- Insertion Sort na nossa linguagem funcional
+-- Insertion sort in our functional language
 
--- Insere o elemento x em uma lista já ordenada xs
+-- Insert element x into an already sorted list xs
 insert x xs = case xs of
   []      -> [x]
 
@@ -9,11 +9,11 @@ insert x xs = case xs of
       then x : xs
       else y : insert x ys
 
--- insertionSort: ordena a lista usando insert recursivamente
+-- insertionSort: sort the list by applying insert recursively
 insertionSort lst = case lst of
   []     -> []
 
   (h:t)  -> insert h (insertionSort t)
 
--- Teste em main
+-- Test in main
 main = insertionSort [34, 7, 23, 32, 5, 62]
