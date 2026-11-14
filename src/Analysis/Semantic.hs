@@ -365,6 +365,29 @@ inferGroup env ds = do
            sc <- generalize env fty
            return (Map.insert f sc m)) env rows
 
+-- | Monomorphic types of the top-level declarations, inferred as one group
+-- (the same group 'checkProgram' types). Empty if inference fails.
+topTypes :: Program -> Map.Map Ident Type
+topTypes prog =
+  case evalState (runExceptT act) (InferState 0 Map.empty) of
+    Left _   -> Map.empty
+    Right xs -> Map.fromList xs
+  where
+    Program ds = desugarProgram prog
+    act = do
+      rows <- forM ds $ \(FunDecl f ps body) -> do
+        ptvs <- mapM (const freshTV) ps
+        rtv  <- freshTV
+        return (f, ps, body, ptvs, rtv, if null ps then rtv else TFun ptvs rtv)
+      let envRec = foldr (\(f,_,_,_,_,fty) m -> Map.insert f (Forall [] fty) m) builtinEnv rows
+      mapM_ (\(_, ps, body, ptvs, rtv, _) -> do
+               let envB = foldr (\(p,tv) m -> Map.insert p (Forall [] tv) m) envRec (zip ps ptvs)
+               tb <- infer envB body
+               unify tb rtv) rows
+      s <- gets subst
+      return [ (f, fixT s fty) | (f,_,_,_,_,fty) <- rows ]
+    fixT s t = let t' = applyT s t in if t' == t then t else fixT s t'
+
 inferPat :: Pattern -> Infer ([(Ident,Type)], Type)
 inferPat = \case
   PWildcard  -> do tv <- freshTV; return ([], tv)

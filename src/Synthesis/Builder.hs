@@ -25,7 +25,7 @@ module Synthesis.Builder
   ) where
 
 import           Prelude hiding (lookup)
-import           Control.Monad          (forM, forM_, zipWithM_, when, foldM)
+import           Control.Monad          (forM, forM_, zipWithM, zipWithM_, when, foldM)
 import           Control.Monad.State    (StateT, get, put, runStateT, gets, modify)
 import           Control.Monad.Trans    (lift)
 import           Data.Maybe             (listToMaybe, catMaybes)
@@ -33,7 +33,8 @@ import           GHC.Float              (castFloatToWord32)
 import qualified Data.Map              as M
 import qualified Data.Set              as S
 
-import           Analysis.Semantic     (assignSuperNames, desugarProgram)
+import           Analysis.Semantic     (assignSuperNames, desugarProgram, topTypes)
+import qualified Analysis.Semantic     as Sem
 import           Syntax
 import           Types                  (DGraph(..), Edge, NodeId, emptyGraph, addNode, addEdge)
 import           Port                   (Port(..), (-->))
@@ -61,6 +62,7 @@ data Val
   = Scalar Port
   | Stream Port [Port]
   | DStream { dsCount :: Port, dsElem :: Port, dsIdx :: Port }
+  | VTup [Val]               -- ^ tuple; components keep their own representation
 
 -- | Builder-time binding: either a realized 'Val' or a lambda to be built.
 data Binding = BVal Val | BLam [Ident] Expr
@@ -89,11 +91,13 @@ data BuildS = BuildS
   , bsLocalFuns  :: !(S.Set Ident) -- ^ Names bound by local (let) declarations.
   , bsInLoop     :: !Bool          -- ^ Building inside a loop body (no nested loops).
   , bsScopeK     :: !Int               -- ^ Scope-level call counter for unique k values (reset on withActive).
+  , bsTypes      :: !(M.Map Ident Sem.Type) -- ^ Inferred types of the top-level declarations.
+  , bsMoveRets   :: ![(NodeId, Maybe Ident)] -- ^ Element-move rets and the function whose exec they run in.
   }
 
 -- | Initial empty builder state.
 emptyS :: BuildS
-emptyS = BuildS emptyGraph [M.empty] M.empty [] S.empty S.empty M.empty Nothing M.empty S.empty S.empty False 0
+emptyS = BuildS emptyGraph [M.empty] M.empty [] S.empty S.empty M.empty Nothing M.empty S.empty S.empty False 0 M.empty []
 
 -- | Builder monad with unique-id generation.
 newtype Build a = Build { unBuild :: StateT BuildS Unique a }
@@ -630,6 +634,7 @@ streamToPair = \case
     -- Right fold with cons over the elements (pair encoding at a boundary).
     nil0 <- constFrom c 0
     backFold c [] c e nil0 (\_ h acc -> pairEnc h acc)
+  VTup vs       -> do ps <- mapM asScalar vs; z <- nilP; foldrM' pairEnc z ps
 
 -- | Use a value in scalar context; streams are re-encoded via 'streamToPair'.
 asScalar :: Val -> Build Port
@@ -644,13 +649,16 @@ data StaticMatch = SMNo | SMYes | SMDyn
   deriving (Eq)
 
 -- | Shape of a value as far as static matching is concerned.
-data Shape = SScalar | SStream Int | SDyn
+data Shape = SScalar | SStream Int | SDyn | STup [Shape]
 
 -- | Classify a pattern against a shape without emitting nodes.
 staticMatch :: Pattern -> Shape -> StaticMatch
 staticMatch pat sh = case (pat, sh) of
   (PWildcard, _)          -> SMYes
   (PVar _, _)             -> SMYes
+  (PTuple ps, STup shs)
+    | length ps == length shs -> both (zipWith staticMatch ps shs)
+  (_, STup _)             -> SMNo
   (_, SScalar)            -> SMDyn
   (PLit _, SDyn)          -> SMNo
   (PTuple _, SDyn)        -> SMNo
@@ -676,6 +684,7 @@ shapeOf = \case
   Scalar _    -> SScalar
   Stream _ ps -> SStream (length ps)
   DStream{}   -> SDyn
+  VTup vs     -> STup (map shapeOf vs)
 
 -- | Build the bindings (and runtime predicate, if any) for a pattern that
 -- 'staticMatch' did not reject. @Nothing@ means statically true.
@@ -695,6 +704,7 @@ matchVal v pat = case (pat, v) of
             _         -> do c' <- subI c 1
                             matchVal (Stream c' xs) pt
     allOf [pure rh, pure rt]
+  (PTuple ps, VTup vs) -> allOf (zipWith (\q w -> matchVal w q) ps vs)
   (PList [], DStream c _ _) -> do
     z  <- constFrom c 0
     eq <- bin2 "equal" (NEqual "") c z
@@ -728,10 +738,11 @@ buildProgram p0 =
       tops = M.fromList [ (f, (ps, b)) | FunDecl f ps b <- decls, not (null ps) ]
       (_, st) = runBuild $ do
         Build $ modify (\s -> s { bsTopDecls = tops
-                                 , bsRecFuns  = recursiveFuns decls })
+                                 , bsRecFuns  = recursiveFuns decls
+                                 , bsTypes    = topTypes p0 })
         mapM_ (\(FunDecl f ps body) -> insertB f (BLam ps body)) decls
         mapM_ buildZero decls
-  in bsGraph st
+  in expandMoveRets st
   where
     retName f = f
     -- | Build and expose zero-argument functions as graph roots.
@@ -756,10 +767,13 @@ funBuilt f = Build $ gets $ \s -> any isRet (M.toList (dgNodes (bsGraph s)))
 
 -- | Return node id for function @f@, creating it if needed.
 retNodeId :: Ident -> Build NodeId
-retNodeId f = Build $ do
+retNodeId = retNamed
+
+-- | Ret node with this name, creating it if needed.
+retNamed :: String -> Build NodeId
+retNamed nm = Build $ do
   s <- get
-  let nm    = f
-      found = [ nid
+  let found = [ nid
               | (nid, n) <- M.toList (dgNodes (bsGraph s))
               , case n of
                   NRet nm' -> nm' == nm
@@ -791,7 +805,18 @@ ensureBuilt f ps body = do
        -- even when the call site sits inside a loop.
        inLoop0 <- Build $ gets bsInLoop
        Build $ modify (\s -> s { bsInLoop = False })
-       _ <- withActive f $ withNoGuard $ withEnv $ do
+       lay <- funLayout f (length ps)
+       case lay of
+        Just (pshs, rsh) -> withActive f $ withNoGuard $ withEnv $ do
+          (vs, _) <- foldM (\(acc, sl) sh -> do (v, sl') <- paramVal f sh sl
+                                                pure (acc ++ [v], sl')) ([], 1) pshs
+          zipWithM_ (\p v -> insertB p (BVal v)) ps vs
+          res <- goExpr body
+          ref <- argNode f 1
+          ws  <- marshal (Just ref) rsh res
+          emitResult f ws
+        Nothing ->
+         withActive f $ withNoGuard $ withEnv $ do
               forM_ (zip [0..] ps) $ \(i, v) -> do
                 let slot = i + 1
                 a <- argNode f slot
@@ -829,7 +854,7 @@ portIsFloat p = Build $ gets $ \s -> isFloatNode s (pNode p)
       Just NFDiv{}           -> True
       Just NSuper{ superNum = k } -> k == builtinFMul || k == builtinFDiv
       Just (NRetSnd f _ _)   -> S.member f (bsFloatFuns s)
-      Just (NRet f)          -> S.member f (bsFloatFuns s)
+      Just (NRet f)          -> S.member (retFun f) (bsFloatFuns s)
       Just NIncTagI{}        -> tracePort0 s nid
       Just NValTag{}         -> tracePort0 s nid
       Just NAddI{}           -> tracePort0 s nid
@@ -839,6 +864,13 @@ portIsFloat p = Build $ gets $ \s -> isFloatNode s (pNode p)
       case [ srcId | (srcId, _, d, dp) <- dgEdges (bsGraph s), d == nid, dp == "0" ] of
         (srcId:_) -> isFloatNode s srcId
         []        -> False
+
+-- | Function a ret belongs to (@f__e0@, @f__r1@ .. are rets of @f@).
+retFun :: String -> String
+retFun = \case
+  ('_':'_':_) -> []
+  (c:cs)      -> c : retFun cs
+  []          -> []
 
 -- | Heuristically check if a port originates from list operations.
 -- Traces through tag-management and steer nodes.
@@ -910,28 +942,33 @@ goExpr = \case
     pc <- boolify pc0
     pcTok <- guardToken pc
     baseK <- Build $ gets bsScopeK
-    vt0 <- withEnv (withGuard pc (goScalar t))
-    vt <- alignExecTo pcTok vt0
+    vtV <- withEnv (withGuard pc (goExpr t))
     kAfterT <- Build $ gets bsScopeK
     Build $ modify (\s -> s { bsScopeK = baseK })
     npc <- notP pc
     npcTok <- guardToken npc
-    ve0 <- withEnv (withGuard npc (goScalar e))
-    ve <- alignExecTo npcTok ve0
+    veV <- withEnv (withGuard npc (goExpr e))
     kAfterE <- Build $ gets bsScopeK
     Build $ modify (\s -> s { bsScopeK = max kAfterT kAfterE })
-    stT <- newNode "if_t" (NSteer "")
-    connect pc (InstPort stT "0")
-    connect vt   (InstPort stT "1")
-    let outT = SteerPort stT "t"
+    if joinKind [vtV, veV] /= KScalar
+      then joinVals [(pc, vtV), (npc, veV)]
+      else do
+        vt0 <- withGuard pc (asScalar vtV)
+        vt <- alignExecTo pcTok vt0
+        ve0 <- withGuard npc (asScalar veV)
+        ve <- alignExecTo npcTok ve0
+        stT <- newNode "if_t" (NSteer "")
+        connect pc (InstPort stT "0")
+        connect vt   (InstPort stT "1")
+        let outT = SteerPort stT "t"
 
-    stF <- newNode "if_f" (NSteer "")
-    connect npc (InstPort stF "0")
-    connect ve   (InstPort stF "1")
-    let outF = SteerPort stF "t"
+        stF <- newNode "if_f" (NSteer "")
+        connect npc (InstPort stF "0")
+        connect ve   (InstPort stF "1")
+        let outF = SteerPort stF "t"
 
-    registerAlias outT [outF]
-    pure (Scalar outT)
+        registerAlias outT [outF]
+        pure (Scalar outT)
 
   -- listas / tuplas: stream estático nativo (length-prefix)
   Cons a b -> do
@@ -941,8 +978,9 @@ goExpr = \case
       Stream c ps -> do c' <- addI c 1; pure (Stream c' (pa : ps))
       Scalar pb   -> Scalar <$> pairEnc pa pb
       DStream{}   -> dsCons pa vb
+      VTup _      -> do pb <- asScalar vb; Scalar <$> pairEnc pa pb
   List xs  -> staticStream xs
-  Tuple xs -> staticStream xs
+  Tuple xs -> VTup <$> mapM goExpr xs
 
   Case scr alts -> compileCase scr alts
 
@@ -1081,10 +1119,13 @@ callgroupPort cg = "cg" ++ show cg ++ "_"
 
 -- | Ensure the formal argument node @fun#i@ exists and return its output port.
 argNode :: String -> Int -> Build Port
-argNode fun i = Build $ do
+argNode fun i = namedArg (fun ++ "#" ++ show i)
+
+-- | Ensure an 'NArg' node with this name exists and return its output port.
+namedArg :: String -> Build Port
+namedArg nm = Build $ do
   s <- get
-  let nm    = fun ++ "#" ++ show i
-      found = [ nid
+  let found = [ nid
               | (nid, n) <- M.toList (dgNodes (bsGraph s))
               , case n of
                   NArg nm' -> nm' == nm
@@ -1152,7 +1193,12 @@ goApp fun args = case fun of
 
 -- | Plain TALM call of @f@ (arguments in scalar form).
 talmCall :: Ident -> [Val] -> Build Val
-talmCall f vals = do
+talmCall f vals = funLayout f (length vals) >>= \case
+  Just lay -> talmCallTyped f lay vals
+  Nothing  -> talmCallPlain f vals
+
+talmCallPlain :: Ident -> [Val] -> Build Val
+talmCallPlain f vals = do
     argv0 <- mapM asScalar vals
     argv1 <- mapM guardIfNeeded argv0
     argv <- alignExecInputs argv1
@@ -1359,17 +1405,35 @@ lowerCall f vals = do
       mdecl   = M.lookup f (bsTopDecls st)
       isRec   = f `S.member` bsRecFuns st
       hasStream = any isStreamVal vals
+      -- With types known, loops only for scalar state and stream-free bodies
+      -- (a stream inside a loop body would put its elements on the tags of
+      -- later iterations).
+      tys     = bsTypes st
+      known   = not (M.null tys)
+      (pTys, rTy) = case M.lookup f tys of
+                      Just (Sem.TFun as r) -> (as, r)
+                      _                    -> ([], Sem.TInt)
+      scalarT t = shapeOfType t == ShS
+      lf      = listFree tys
+      elemScalar = \case { Sem.TList t -> scalarT t; _ -> False }
+      tailOK ts = not known || ( all scalarT pTys && scalarT rTy
+                               && all lf (tsCond ts : tsBase ts : tsArgs ts) )
+      consOK cs = not known || ( and [ scalarT t | (k, t) <- zip [0 ..] pTys, k /= csIdx cs ]
+                               && scalarT rTy && lf (csBase cs) && lf (csBody cs)
+                               && maybe False elemScalar (listToMaybe (drop (csIdx cs) pTys)) )
+      prodOK pr = not known || ( all scalarT pTys && elemScalar rTy
+                               && all lf (prCond pr : prElem pr : prArgs pr) )
   case mdecl of
     Just (ps, body)
       | not isLocal, length ps == length vals, not (bsInLoop st) ->
           case ( recognizeTail f ps body, recognizeConsumer f ps body
                , recognizeProducer f ps body ) of
-            (Just ts, _, _) -> Just <$> tailLoop ps ts vals
-            (_, Just cs, _) | Stream _ xs <- vals !! csIdx cs ->
+            (Just ts, _, _) | tailOK ts -> Just <$> tailLoop ps ts vals
+            (_, Just cs, _) | consOK cs, Stream _ xs <- vals !! csIdx cs ->
                                 Just <$> consumerLoop ps cs (Left xs) vals
-            (_, Just cs, _) | DStream c e _ <- vals !! csIdx cs ->
+            (_, Just cs, _) | consOK cs, DStream c e _ <- vals !! csIdx cs ->
                                 Just <$> consumerLoop ps cs (Right (c, e)) vals
-            (_, _, Just pr) -> Just <$> producerLoop ps pr vals
+            (_, _, Just pr) | prodOK pr -> Just <$> producerLoop ps pr vals
             _ | not isRec && hasStream -> Just <$> inlineCall ps body vals
             _ -> pure Nothing
       | not isLocal, length ps == length vals, not isRec, hasStream ->
@@ -1386,6 +1450,7 @@ guardVal = \case
   -- Elements live at other tags; gating the count (and hence any loop that
   -- reads them) is enough.
   DStream c e i -> (\c' -> DStream c' e i) <$> guardIfNeeded c
+  VTup vs       -> VTup <$> mapM guardVal vs
 
 -- | Inline a non-recursive function: bind the parameters to the actual values.
 inlineCall :: [Ident] -> Expr -> [Val] -> Build Val
@@ -1409,30 +1474,30 @@ inLoopCtx tok m = do
 node1 :: String -> DNode -> Port -> Build Port
 node1 lbl nd p = do
   nid <- newNode lbl nd
-  connect p (InstPort nid "0")
+  connectPlus p (InstPort nid "0")
   pure (out0 nid)
 
 -- | Raw two-input node.
 node2 :: String -> DNode -> Port -> Port -> Build Port
 node2 lbl nd a b = do
   nid <- newNode lbl nd
-  connect a (InstPort nid "0")
-  connect b (InstPort nid "1")
+  connectPlus a (InstPort nid "0")
+  connectPlus b (InstPort nid "1")
   pure (out0 nid)
 
 -- | Merge several producers into one port (identity addi with a source list).
 mergeP :: String -> [Port] -> Build NodeId
 mergeP lbl srcs = do
   nid <- newNode lbl (NAddI "" 0)
-  mapM_ (\p -> connect p (InstPort nid "0")) srcs
+  mapM_ (\p -> connectPlus p (InstPort nid "0")) srcs
   pure nid
 
 -- | Steer @v@ on @c@: (true side, false side).
 steerP :: Port -> Port -> Build (Port, Port)
 steerP c v = do
   sid <- newNode "loop_steer" (NSteer "")
-  connect c (InstPort sid "0")
-  connect v (InstPort sid "1")
+  connectPlus c (InstPort sid "0")
+  connectPlus v (InstPort sid "1")
   pure (SteerPort sid "t", SteerPort sid "f")
 
 tagValP :: Port -> Build Port
@@ -1455,7 +1520,7 @@ tailLoop ps ts vals = do
   entry <- tagValP ref                       -- t0, carried to restore the tag
   -- headers: inctag [init, feedback]
   hdrs <- mapM (\_ -> newNode "loop_inctag" (NIncTag "")) (inits ++ [entry])
-  zipWithM_ (\h p -> connect p (InstPort h "0")) hdrs (inits ++ [entry])
+  zipWithM_ (\h p -> connectPlus p (InstPort h "0")) hdrs (inits ++ [entry])
   let hps     = map out0 hdrs
       hParams = init hps
       hEntry  = last hps
@@ -1471,7 +1536,7 @@ tailLoop ps ts vals = do
   nexts <- inLoopCtx tokC $ withEnv $ do
              zipWithM_ (\p v -> insertB p (BVal (Scalar v))) ps (init contS)
              mapM goScalar (tsArgs ts)
-  zipWithM_ (\h n -> connect n (InstPort h "0")) hdrs (nexts ++ [last contS])
+  zipWithM_ (\h n -> connectPlus n (InstPort h "0")) hdrs (nexts ++ [last contS])
   -- exit: base, moved back to the entry tag
   tokE <- constFrom (head exitS) 1
   res <- inLoopCtx tokE $ withEnv $ do
@@ -1490,7 +1555,7 @@ producerLoop ps pr vals = do
   j0    <- constFrom ref 0
   let carried = inits ++ [entry, j0]
   hdrs <- mapM (\_ -> newNode "loop_inctag" (NIncTag "")) carried
-  zipWithM_ (\h p -> connect p (InstPort h "0")) hdrs carried
+  zipWithM_ (\h p -> connectPlus p (InstPort h "0")) hdrs carried
   let hps = map out0 hdrs
       np  = length inits
   tokH <- constFrom (head hps) 1
@@ -1510,7 +1575,7 @@ producerLoop ps pr vals = do
                    pure (e, ns)
   elA <- alignExecTo jC el
   j'  <- addI jC 1
-  zipWithM_ (\h n -> connect n (InstPort h "0")) hdrs (nexts ++ [entC, j'])
+  zipWithM_ (\h n -> connectPlus n (InstPort h "0")) hdrs (nexts ++ [entC, j'])
   cnt <- valTagP jE entE
   pure (DStream cnt elA jC)
 
@@ -1624,9 +1689,434 @@ backFold ref invs cnt elems base step = do
   tokD <- constFrom dAcc 1
   acc' <- inLoopCtx tokD (step dInvs elems dAcc)
   r'   <- subI dR 1
-  zipWithM_ (\h p -> connect p (InstPort h "0")) hdrs (acc' : r' : dInvs)
+  zipWithM_ (\h p -> connectPlus p (InstPort h "0")) hdrs (acc' : r' : dInvs)
   -- exit (count 0 left) happens at tag t0+1: move back to t0
   incTagIP (-1) (snd (head steered))
+
+-- Streams across calls ----------------------------------------------------
+--
+-- A top-level function whose inferred type mentions lists or tuples gets a
+-- typed call layout. Each parameter and the result is flattened into wires:
+-- a scalar is one wire, a list is a DStream wire, a tuple is its components.
+--
+-- * Scalar wires (and the count of every DStream wire) go through the usual
+--   callsnd/retsnd/ret protocol.
+-- * Elements and indices cannot go through callsnd: a callsnd counts every
+--   token it sends, so N elements would land in N different execs. They are
+--   moved with ret instead, which sets the exec from its control operand:
+--   @ret W, elem, ctl@ puts elem in exec ctl.value at the same tag.
+--   Call side: the callee exec X is obtained as a value in the caller exec
+--   ('execValue'), spread over the element tags ('spreadP') and used as the
+--   control of the moving rets; their outputs feed the callee's element
+--   input. Return side: the return address (the caller exec, which the
+--   retsnd delivers) is spread the same way and the callee's element rets
+--   route by call site like any ret (@f__e<j>.cg@).
+-- Positions stay in tags (element k at tag t0+1+k on both sides); execs keep
+-- call instances apart.
+
+-- | Representation a value takes at a call boundary.
+data VShape = ShS | ShL | ShT [VShape]
+  deriving (Eq)
+
+shapeOfType :: Sem.Type -> VShape
+shapeOfType = \case
+  Sem.TList _   -> ShL
+  Sem.TTuple ts -> ShT (map shapeOfType ts)
+  _             -> ShS
+
+typeHasList :: Sem.Type -> Bool
+typeHasList = \case
+  Sem.TList _   -> True
+  Sem.TTuple ts -> any typeHasList ts
+  Sem.TFun as r -> any typeHasList (r : as)
+  _             -> False
+
+-- | Typed call layout of a top-level function (Nothing: all scalar, plain call).
+funLayout :: Ident -> Int -> Build (Maybe ([VShape], VShape))
+funLayout f n = do
+  st <- Build get
+  if f `S.member` bsLocalFuns st || not (M.member f (bsTopDecls st))
+    then pure Nothing
+    else case M.lookup f (bsTypes st) of
+      Just (Sem.TFun as r) | length as == n ->
+        let pshs = map shapeOfType as
+            rsh  = shapeOfType r
+        in pure (if all (== ShS) (rsh : pshs) then Nothing else Just (pshs, rsh))
+      _ -> pure Nothing
+
+-- | One wire of a flattened value.
+data Wire = WS Port | WD Port Port Port
+
+wireScalar :: Wire -> Port
+wireScalar = \case
+  WS p     -> p
+  WD c _ _ -> c
+
+-- | A port of the value's own context (tag/exec).
+valRef :: Val -> Port
+valRef = \case
+  Scalar p      -> p
+  Stream c _    -> c
+  DStream c _ _ -> c
+  VTup (v:_)    -> valRef v
+  VTup []       -> InstPort (-1) "0"
+
+valPorts :: Val -> [Port]
+valPorts = \case
+  Scalar p      -> [p]
+  Stream c ps   -> ps ++ [c]
+  DStream c _ _ -> [c]
+  VTup vs       -> concatMap valPorts vs
+
+firstNonConst :: [Port] -> Build (Maybe Port)
+firstNonConst ps = do
+  cs <- mapM getConstI ps
+  pure (listToMaybe [ p | (p, Nothing) <- zip ps cs, pNode p /= (-1) ])
+
+-- | Context reference for aligning constants: the guard, else a value port.
+ctxRef :: [Val] -> Build (Maybe Port)
+ctxRef vs = do
+  mg <- Build $ gets bsGuard
+  case mg of
+    Just g  -> pure (Just g)
+    Nothing -> firstNonConst (concatMap valPorts vs)
+
+alignC :: Maybe Port -> Port -> Build Port
+alignC Nothing p  = pure p
+alignC (Just r) p = do
+  mc <- getConstI p
+  case mc of
+    Just k  -> constFrom r k
+    Nothing -> pure p
+
+-- | A port that never fires (elements of an empty stream).
+neverP :: Port -> Build Port
+neverP r = do z <- constFrom r 0; fst <$> steerP z r
+
+freshName :: String -> Build String
+freshName pre = Build (lift freshId) >>= \n -> pure (pre ++ show n)
+
+-- | Any list value as a DStream (count, elements, indices).
+toDStream :: Maybe Port -> Val -> Build (Port, Port, Port)
+toDStream ref v = case v of
+  DStream c e i -> pure (c, e, i)
+  Stream c [] -> do
+    c' <- alignC ref c
+    nv <- neverP c'
+    pure (c', nv, nv)
+  Stream c ps -> do
+    r <- maybe (firstNonConst (ps ++ [c])) (pure . Just) ref
+    ps' <- mapM (alignC r) ps
+    c'  <- alignC r c
+    t0  <- maybe (withNoGuard (constI 0)) tagValP r
+    t1  <- addI t0 1
+    eis <- forM (zip [0 :: Int ..] ps') $ \(k, p) -> do
+             tk <- if k == 0 then pure t1 else addI t1 k
+             e  <- valTagP p tk
+             ik <- constFrom p k
+             i  <- valTagP ik tk
+             pure (e, i)
+    em <- mergeP "ds_elem" (map fst eis)
+    im <- mergeP "ds_idx" (map snd eis)
+    pure (c', out0 em, out0 im)
+  Scalar p -> alignC ref p >>= pairToDStream
+  VTup _   -> asScalar v >>= pairToDStream
+
+-- | Walk a pair-encoded list (list supers) into a DStream: forward loop that
+-- emits head at tag t0+1+k with its index k; at nil the count goes back to t0.
+pairToDStream :: Port -> Build (Port, Port, Port)
+pairToDStream p = do
+  entry <- tagValP p
+  j0    <- constFrom p 0
+  let inits = [p, entry, j0]
+  hdrs <- mapM (\_ -> newNode "p2s_inctag" (NIncTag "")) inits
+  zipWithM_ (\h x -> connectPlus x (InstPort h "0")) hdrs inits
+  let hps = map out0 hdrs
+  isn <- callBuiltinSuper builtinListIsNil [head hps]
+  steered <- mapM (steerP isn) hps
+  let [(_, cK), (eX, eK), (jX, jK)] = steered
+  el  <- fstDec cK
+  nxt <- sndDec cK
+  j'  <- addI jK 1
+  zipWithM_ (\h x -> connect x (InstPort h "0")) hdrs [nxt, eK, j']
+  cnt <- valTagP jX eX
+  pure (cnt, el, jK)
+
+-- | Value @v@ (tag t0) replicated at tags t0+1 .. t0+n, n the count @c@ (tag t0).
+spreadP :: Port -> Port -> Build Port
+spreadP v c = do
+  hV <- newNode "spread_v" (NIncTag "")
+  hR <- newNode "spread_r" (NIncTag "")
+  connectPlus v (InstPort hV "0")
+  connectPlus c (InstPort hR "0")
+  z    <- constFrom (out0 hR) 0
+  more <- node2 "gthan" (NGThan "") (out0 hR) z
+  (vT, _) <- steerP more (out0 hV)
+  (rT, _) <- steerP more (out0 hR)
+  r' <- subI rT 1
+  connect vT (InstPort hV "0")
+  connect r' (InstPort hR "0")
+  pure vT
+
+-- | Gate a DStream by the current guard: count and every element.
+gateDS :: Val -> Build Val
+gateDS v = case v of
+  DStream c e i -> do
+    mg <- Build $ gets bsGuard
+    case mg of
+      Nothing -> pure v
+      Just _  -> do
+        c'   <- guardIfNeeded c
+        one  <- constFrom c' 1
+        pass <- spreadP one c'
+        (e', _) <- steerP pass e
+        (i', _) <- steerP pass i
+        pure (DStream c' e' i')
+  _ -> pure v
+
+-- | How branch values are joined.
+data JoinKind = KScalar | KDS | KTup Int
+  deriving (Eq)
+
+joinKind :: [Val] -> JoinKind
+joinKind vs
+  | Just n <- tupArity                       = KTup n
+  | any isDS vs, not (any isTup vs)          = KDS
+  | otherwise                                = KScalar
+  where
+    isDS  = \case { DStream{} -> True; _ -> False }
+    isTup = \case { VTup _ -> True; _ -> False }
+    tupArity = case [ length ws | VTup ws <- vs ] of
+      ns@(n:_) | length ns == length vs, all (== n) ns -> Just n
+      _ -> Nothing
+
+-- | Join branch values, each built under its guard. Scalars are steered by the
+-- guard token; DStreams are gated (count and elements) and merged, so only the
+-- taken branch's tokens reach the result.
+joinVals :: [(Port, Val)] -> Build Val
+joinVals brs = case joinKind (map snd brs) of
+  KTup n -> VTup <$> forM [0 .. n - 1] (\k ->
+              joinVals [ (g, comp k v) | (g, v) <- brs ])
+  KDS -> do
+    parts <- forM brs $ \(g, v) -> withGuard g $ do
+      ref <- Build $ gets bsGuard
+      v1  <- case v of
+               Scalar p -> Scalar <$> guardIfNeeded p
+               _        -> pure v
+      (c, e, i) <- toDStream ref v1
+      gateDS (DStream c e i)
+    cm <- mergeP "join_cnt"  [ c | DStream c _ _ <- parts ]
+    em <- mergeP "join_elem" [ e | DStream _ e _ <- parts ]
+    im <- mergeP "join_idx"  [ i | DStream _ _ i <- parts ]
+    pure (DStream (out0 cm) (out0 em) (out0 im))
+  KScalar -> do
+    outs <- forM brs $ \(g, v) -> do
+      p0  <- withGuard g (asScalar v)
+      p   <- alignExecTo g p0
+      tok <- guardToken g
+      sid <- newNode "steer" (NSteer "")
+      connect tok (InstPort sid "0")
+      connect p   (InstPort sid "1")
+      pure (SteerPort sid "t")
+    case outs of
+      (h:rest) -> registerAlias h rest >> pure (Scalar h)
+      []       -> Scalar <$> falseP
+  where
+    comp k = \case
+      VTup ws -> ws !! k
+      w       -> w
+
+-- | Flatten a value into wires following a shape.
+marshal :: Maybe Port -> VShape -> Val -> Build [Wire]
+marshal ref sh v = case sh of
+  ShS -> do p <- asScalar v; p' <- alignC ref p; pure [WS p']
+  ShL -> do (c, e, i) <- toDStream ref v; pure [WD c e i]
+  ShT shs -> do
+    comps <- case v of
+      VTup ws     | length ws == length shs -> pure ws
+      Stream _ ps | length ps == length shs -> pure (map Scalar ps)
+      _ -> do p <- asScalar v; map Scalar <$> tupleComps p (length shs)
+    concat <$> zipWithM (marshal ref) shs comps
+  where
+    tupleComps _ 0 = pure []
+    tupleComps p 1 = (: []) <$> fstDec p
+    tupleComps p n = do hd <- fstDec p; tl <- sndDec p; (hd :) <$> tupleComps tl (n - 1)
+
+-- | Is each wire of a shape a stream?
+flatShape :: VShape -> [Bool]
+flatShape = \case
+  ShS     -> [False]
+  ShL     -> [True]
+  ShT shs -> concatMap flatShape shs
+
+-- | Name of the ret carrying result wire @j@ (wire 0 keeps the function name).
+retNameJ :: Ident -> Int -> String
+retNameJ f 0 = f
+retNameJ f j = f ++ "__r" ++ show j
+
+-- | Callee parameter value of a shape, starting at formal slot @slot@.
+paramVal :: Ident -> VShape -> Int -> Build (Val, Int)
+paramVal f sh slot = case sh of
+  ShS -> do a <- argNode f slot; pure (Scalar a, slot + 1)
+  ShL -> do
+    c <- argNode f slot
+    e <- namedArg (f ++ "#e" ++ show slot)
+    i <- namedArg (f ++ "#i" ++ show slot)
+    pure (DStream c e i, slot + 1)
+  ShT shs -> do
+    (vs, s') <- foldM (\(acc, sl) sh' -> do (v, sl') <- paramVal f sh' sl
+                                            pure (acc ++ [v], sl')) ([], slot) shs
+    pure (VTup vs, s')
+
+-- | Caller-side result value of a shape, read from output @cgp@ of the rets.
+resultVal :: Ident -> String -> VShape -> Int -> Build (Val, Int)
+resultVal f cgp sh j = case sh of
+  ShS -> do r <- retNamed (retNameJ f j); pure (Scalar (InstPort r cgp), j + 1)
+  ShL -> do
+    r  <- retNamed (retNameJ f j)
+    re <- retNamed (f ++ "__e" ++ show j)
+    ri <- retNamed (f ++ "__i" ++ show j)
+    pure (DStream (InstPort r cgp) (InstPort re cgp) (InstPort ri cgp), j + 1)
+  ShT shs -> do
+    (vs, j') <- foldM (\(acc, k) sh' -> do (v, k') <- resultVal f cgp sh' k
+                                           pure (acc ++ [v], k')) ([], j) shs
+    pure (VTup vs, j')
+
+-- | Callee side: connect the result wires to their rets.
+emitResult :: Ident -> [Wire] -> Build ()
+emitResult f ws = forM_ (zip [0 ..] ws) $ \(j, w) -> do
+  r <- retNamed (retNameJ f j)
+  connectPlus (wireScalar w) (InstPort r "0")
+  case w of
+    WD c e i -> do
+      ra  <- namedArg (f ++ "#ra")
+      ctl <- spreadP ra c
+      re  <- retNamed (f ++ "__e" ++ show j)
+      ri  <- retNamed (f ++ "__i" ++ show j)
+      connectPlus e (InstPort re "0"); connect ctl (InstPort re "1")
+      connectPlus i (InstPort ri "0"); connect ctl (InstPort ri "1")
+    WS _ -> pure ()
+
+-- | The callee exec of a call instance, as a value in the caller exec, at the
+-- tag of @tok@ (the token that feeds the first callsnd). A callsnd in the
+-- same callgroup, fed by @tok@, runs in step with the argument callsnds and
+-- so lands in the callee exec X; two retsnds of a private callgroup turn it
+-- and @tok@ into (value X) and (value caller exec) in a common exec, and a
+-- ret of those two yields X in the caller exec.
+execValue :: NodeId -> Port -> Build Port
+execValue cg tok = do
+  xa <- freshName "xa"
+  a  <- newNode xa (NCallSnd xa 0 cg)
+  connectPlus tok (InstPort a "0")
+  zn <- freshName "xv"
+  q  <- newNode zn (NCallGroup zn)
+  b  <- newNode "xb" (NRetSnd "xb" 0 q)
+  connect (out0 a) (InstPort b "0")
+  c  <- newNode "xc" (NRetSnd "xc" 0 q)
+  connectPlus tok (InstPort c "0")
+  d  <- newNode zn (NRet zn)
+  connect (out0 b) (InstPort d "0")
+  connect (out0 c) (InstPort d "1")
+  pure (InstPort d (callgroupPort q))
+
+-- | Move @src@ to the exec given by @ctl@ (same tag) and feed @dst@. The ret
+-- picks its output port from the caller exec's callgroup index, which is
+-- only known at run time; the post-pass in 'buildProgram' adds the other
+-- ports ('expandMoveRets').
+moveRet :: Maybe Ident -> Port -> Port -> Port -> Build ()
+moveRet owner src ctl dst = do
+  nm <- freshName "mv"
+  d  <- newNode nm (NRet nm)
+  connectPlus src (InstPort d "0")
+  connect ctl (InstPort d "1")
+  Build $ modify (\s -> s { bsMoveRets = (d, owner) : bsMoveRets s })
+  connect (InstPort d "0") dst
+
+-- | Every move ret serves the exec of its owner function, whose callgroup
+-- index can be any of 0 .. (number of callgroups of the owner) - 1.
+expandMoveRets :: BuildS -> DFG
+expandMoveRets st = foldr addEdge g extra
+  where
+    g = bsGraph st
+    cgCount = M.fromListWith (+) [ (nName n, 1 :: Int) | n@NCallGroup{} <- M.elems (dgNodes g) ]
+    extra = [ (d, show k, dst, dp)
+            | (d, owner) <- bsMoveRets st
+            , let nP = maybe 1 (\o -> max 1 (M.findWithDefault 0 o cgCount)) owner
+            , (s, sp, dst, dp) <- dgEdges g, s == d, sp == "0"
+            , k <- [1 .. nP - 1] ]
+
+-- | TALM call with a typed layout (streams and tuples cross natively).
+talmCallTyped :: Ident -> ([VShape], VShape) -> [Val] -> Build Val
+talmCallTyped f (pshs, rsh) vals = do
+  ref0  <- ctxRef vals
+  wires <- concat <$> zipWithM (marshal ref0) pshs vals
+  argv1 <- mapM (guardIfNeeded . wireScalar) wires
+  argv  <- alignExecInputs argv1
+  anyFloat <- or <$> mapM portIsFloat argv
+  when anyFloat (markFloatFun f)
+  lookupB f >>= \case
+    Just (BLam ps body) -> ensureBuilt f ps body
+    _                   -> pure ()
+  cg <- newNode f (NCallGroup f)
+  argvS <- syncArgs argv
+  forM_ (zip [1..] argvS) $ \(slot, a) -> do
+    let nm = f ++ "#" ++ show (slot :: Int)
+    cs <- newNode nm (NCallSnd nm 0 cg)
+    connectPlus a (InstPort cs "0")
+    ap <- argNode f slot
+    case ap of
+      InstPort nid _ -> connectPlus (out0 cs) (InstPort nid "0")
+      _              -> pure ()
+  retTok <- case argvS of
+    (a0:_) -> pure a0
+    []     -> constI 0
+  rs <- newNode (f ++ "#0") (NRetSnd (f ++ "#0") 0 cg)
+  connectPlus retTok (InstPort rs "0")
+  let flat = flatShape rsh
+  forM_ (zip [0 ..] flat) $ \(j, _) -> do
+    r <- retNamed (retNameJ f j)
+    connect (out0 rs) (InstPort r "1")
+  when (or flat) $ do
+    ra <- namedArg (f ++ "#ra")
+    connect (out0 rs) (InstPort (pNode ra) "0")
+  let dws = [ (slot, e, i) | (slot, WD _ e i) <- zip [1 ..] wires ]
+  when (not (null dws)) $ do
+    xv    <- execValue cg retTok
+    owner <- Build $ gets (listToMaybe . bsActive)
+    forM_ dws $ \(slot, e, i) -> do
+      ctl <- spreadP xv (argvS !! (slot - 1))
+      ein <- namedArg (f ++ "#e" ++ show slot)
+      iin <- namedArg (f ++ "#i" ++ show slot)
+      moveRet owner e ctl (InstPort (pNode ein) "0")
+      moveRet owner i ctl (InstPort (pNode iin) "0")
+  fst <$> resultVal f (callgroupPort cg) rsh 0
+
+-- | A loop body must not hold streams (its tags are the loop's iterations):
+-- no list literals or patterns, no reference to list-typed top-level names.
+listFree :: M.Map Ident Sem.Type -> Expr -> Bool
+listFree tys = go
+  where
+    bad x = maybe False typeHasList (M.lookup x tys)
+            || x `elem` ["printl", "printlf", "printmf", "prints"]
+    go = \case
+      Var x         -> not (bad x)
+      Lit _         -> True
+      Lambda _ b    -> go b
+      If c t e      -> go c && go t && go e
+      Case sc alts  -> go sc && all (patOK . fst) alts && all (go . snd) alts
+      Let ds b      -> all (\(FunDecl _ _ x) -> go x) ds && go b
+      App a b       -> go a && go b
+      BinOp _ l r   -> go l && go r
+      UnOp _ x      -> go x
+      List _        -> False
+      Tuple es      -> all go es
+      Cons _ _      -> False
+      Super{}       -> True
+    patOK = \case
+      PCons{}   -> False
+      PList _   -> False
+      PTuple qs -> all patOK qs
+      _         -> True
 
 -- Literais -------------------------------------------------------------
 
@@ -1720,10 +2210,7 @@ compileCase scr alts = do
     _ -> do
       -- Streams: drop alternatives that cannot match (static count) and stop
       -- at the first one that always matches; dynamic ones test at runtime.
-      let c = case vscr of
-                Stream c0 _    -> c0
-                DStream c0 _ _ -> c0
-                Scalar p0      -> p0
+      let c = valRef vscr
       let classified = [ (p, e, staticMatch p (shapeOf vscr)) | (p, e) <- alts ]
           live       = cutAtYes [ a | a@(_, _, m) <- classified, m /= SMNo ]
       case live of
@@ -1755,14 +2242,28 @@ compileCase scr alts = do
       pure (pp, bs)
     steerAlts taken0 alts' = do
       baseK <- Build $ gets bsScopeK
-      outs <- goAlts taken0 alts' [] baseK
-      case outs of
-        []       -> Scalar <$> falseP
-        (h:rest) -> registerAlias h rest >> pure (Scalar h)
+      brs <- goAlts taken0 alts' [] baseK
+      case brs of
+        [] -> Scalar <$> falseP
+        _ | joinKind (map snd brs) /= KScalar -> joinVals brs
+          | otherwise -> do
+              outs <- forM brs $ \(guardi, v) -> do
+                val0 <- withGuard guardi (asScalar v)
+                val  <- alignExecTo guardi val0
+                tok  <- guardToken guardi
+                sid  <- newNode "steer" (NSteer "")
+                connect tok (InstPort sid "0")
+                connect val (InstPort sid "1")
+                pure (SteerPort sid "t")
+              case outs of
+                (h:rest) -> registerAlias h rest >> pure (Scalar h)
+                []       -> Scalar <$> falseP
+    -- Each alternative: its guard (pattern matched and no earlier one taken)
+    -- and its value built under that guard.
     -- Última alternativa: NÃO compute orP/taken' (evita nó morto).
     goAlts _     []              acc _maxK = pure (reverse acc)
     goAlts taken [(mkPred,e)]    acc _maxK = do
-      (pPred, binds, guardi) <- withNoGuard $ do
+      (_pPred, binds, guardi) <- withNoGuard $ do
         (pp0, bs) <- mkPred
         pp <- boolify pp0
         pp' <- alignExecTo taken pp
@@ -1771,22 +2272,16 @@ compileCase scr alts = do
         g   <- andP pp' nt'
         pure (pp', bs, g)
       baseK <- Build $ gets bsScopeK
-      val0 <- withEnv $ withGuard guardi $ do
-               mapM_ (\(x,v) -> insertB x (BVal v)) binds
-               goScalar e
-      val <- alignExecTo guardi val0
+      v <- withEnv $ withGuard guardi $ do
+             mapM_ (\(x,w) -> insertB x (BVal w)) binds
+             goExpr e
       kAfter <- Build $ gets bsScopeK
       Build $ modify (\s -> s { bsScopeK = max (max _maxK kAfter) baseK })
-      tok <- guardToken guardi
-      sid <- newNode "steer" (NSteer "")
-      connect tok (InstPort sid "0")
-      connect val (InstPort sid "1")
-      let out = SteerPort sid "t"
-      pure (reverse (out:acc))
+      pure (reverse ((guardi, v):acc))
 
     -- Alternativas intermediárias: mantém o cálculo de taken'
     goAlts taken ((mkPred,e):rs) acc maxK0 = do
-      (pPred, binds, guardi, taken') <- withNoGuard $ do
+      (_pPred, binds, guardi, taken') <- withNoGuard $ do
         (pp0, bs) <- mkPred
         pp <- boolify pp0
         pp' <- alignExecTo taken pp
@@ -1796,18 +2291,12 @@ compileCase scr alts = do
         tk  <- orP taken pp'
         pure (pp', bs, g, tk)
       baseK <- Build $ gets bsScopeK
-      val0 <- withEnv $ withGuard guardi $ do
-               mapM_ (\(x,v) -> insertB x (BVal v)) binds
-               goScalar e
-      val <- alignExecTo guardi val0
+      v <- withEnv $ withGuard guardi $ do
+             mapM_ (\(x,w) -> insertB x (BVal w)) binds
+             goExpr e
       kAfter <- Build $ gets bsScopeK
       Build $ modify (\s -> s { bsScopeK = baseK })
-      tok <- guardToken guardi
-      sid <- newNode "steer" (NSteer "")
-      connect tok (InstPort sid "0")
-      connect val (InstPort sid "1")
-      let out = SteerPort sid "t"
-      goAlts taken' rs (out:acc) (max maxK0 kAfter)
+      goAlts taken' rs ((guardi, v):acc) (max maxK0 kAfter)
 
 -- | Build the predicate and bindings for matching a 'Pattern' against a scrutinee port.
 patPred :: Port -> Pattern -> Build (Port, [(Ident, Port)])
