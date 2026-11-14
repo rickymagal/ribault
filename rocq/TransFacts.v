@@ -85,3 +85,127 @@ Proof.
     destruct (lookup_node ns m) as [nd|]; [| reflexivity].
     destruct nd; repeat rewrite Hres; reflexivity.
 Qed.
+
+(* every id bound in rho is < b *)
+Definition cenv_below (rho : cenv) (b : nat) : Prop :=
+  forall x i, In (x, i) rho -> i < b.
+
+(* the variable that clookup resolves belongs to rho *)
+Lemma clookup_in : forall rho x i, clookup rho x = Some i -> In (x, i) rho.
+Proof.
+  induction rho as [|[y j] r IH]; simpl; intros x i H.
+  - discriminate.
+  - destruct (String.eqb x y) eqn:E.
+    + apply String.eqb_eq in E. subst y. inversion H; subst. left. reflexivity.
+    + right. apply IH. exact H.
+Qed.
+
+(* the freshness postcondition of trans *)
+Definition fresh_post (k : nat) (ns : list (nodeid * node))
+           (es : list (nodeid * portid * nodeid * portid))
+           (k' : nat) (ns' : list (nodeid * node))
+           (es' : list (nodeid * portid * nodeid * portid)) (out : nodeid) : Prop :=
+    k <= k'
+    /\ nodes_below ns' k'
+    /\ edges_below es' k'
+    /\ out < k'
+    /\ (exists ns_ex, ns' = (ns_ex ++ ns)%list
+          /\ forall i nd, In (i, nd) ns_ex -> k <= i < k')
+    /\ (exists es_ex, es' = (es_ex ++ es)%list
+          /\ forall s sp t tp, In (s, sp, t, tp) es_ex -> k <= t < k').
+
+(* one fresh node, no new edge *)
+Lemma leaf_fresh : forall k ns es nd,
+  nodes_below ns k -> edges_below es k ->
+  fresh_post k ns es (S k) ((k, nd) :: ns) es k.
+Proof.
+  intros k ns es nd Hn He. unfold fresh_post.
+  split; [lia|]. split; [|split; [|split; [lia|split]]].
+  - intros i nd' [H|H]; [inversion H; lia | apply Hn in H; lia].
+  - intros s sp t tp H. apply He in H. lia.
+  - exists [(k, nd)]. split; [reflexivity|].
+    intros i nd' [H|[]]. inversion H; lia.
+  - exists []. split; [reflexivity|]. intros s sp t tp [].
+Qed.
+
+(* FRESHNESS: starting from a graph with ids < k, trans produces ids < k',
+   with k <= k', the additions in [k,k'), output < k', and the new graph
+   is the additions prepended to the old one. Supplies the hypotheses of
+   eval_dfg_extend at every compound node of the agreement theorem. *)
+Lemma trans_fresh :
+  forall e k ns es rho k' ns' es' out,
+    trans k ns es rho e = (k', ns', es', out) ->
+    nodes_below ns k -> edges_below es k -> cenv_below rho k ->
+    k <= k'
+    /\ nodes_below ns' k'
+    /\ edges_below es' k'
+    /\ out < k'
+    /\ (exists ns_ex, ns' = (ns_ex ++ ns)%list
+          /\ forall i nd, In (i, nd) ns_ex -> k <= i < k')
+    /\ (exists es_ex, es' = (es_ex ++ es)%list
+          /\ forall s sp t tp, In (s, sp, t, tp) es_ex -> k <= t < k').
+Proof.
+  intro e.
+  change (forall k ns es rho k' ns' es' out,
+    trans k ns es rho e = (k', ns', es', out) ->
+    nodes_below ns k -> edges_below es k -> cenv_below rho k ->
+    fresh_post k ns es k' ns' es' out).
+  induction e as [n|b|x|u e1 IH1|o e1 IH1 e2 IH2|c e1 e2 e3|x e1 IH1 e2 IH2|f args];
+    intros k ns es rho k' ns' es' out Htr Hn He Hc; cbn in Htr.
+  - inversion Htr; subst. apply leaf_fresh; assumption.
+  - inversion Htr; subst. apply leaf_fresh; assumption.
+  - destruct (clookup rho x) as [i|] eqn:Ec; inversion Htr; subst.
+    + pose proof (Hc _ _ (clookup_in _ _ _ Ec)) as Hi.
+      unfold fresh_post. split; [lia|]. split; [exact Hn|].
+      split; [exact He|]. split; [exact Hi|]. split.
+      * exists []. split; [reflexivity|]. intros i' nd [].
+      * exists []. split; [reflexivity|]. intros s sp t tp [].
+    + apply leaf_fresh; assumption.
+  - destruct (trans k ns es rho e1) as [[[k1 ns1] es1] o1] eqn:E1.
+    destruct (IH1 _ _ _ _ _ _ _ _ E1 Hn He Hc)
+      as [Hk1 [Hn1 [He1 [Ho1 [[nx1 [Hns1 Hnx1]] [ex1 [Hes1 Hex1]]]]]]].
+    injection Htr as <- <- <- <-. subst ns1 es1. unfold fresh_post.
+    split; [lia|]. split; [|split; [|split; [lia|split]]].
+    + intros i nd [H|H]; [inversion H; lia | apply Hn1 in H; lia].
+    + intros s sp t tp [H|H]; [inversion H; subst; lia | apply He1 in H; lia].
+    + exists ((k1, DUn u) :: nx1). split; [reflexivity|].
+      intros i nd [H|H]; [inversion H; lia | apply Hnx1 in H; lia].
+    + exists ((o1, oport, k1, "0") :: ex1). split; [reflexivity|].
+      intros s sp t tp [H|H]; [inversion H; lia | apply Hex1 in H; lia].
+  - destruct (trans k ns es rho e1) as [[[k1 ns1] es1] o1] eqn:E1.
+    destruct (IH1 _ _ _ _ _ _ _ _ E1 Hn He Hc)
+      as [Hk1 [Hn1 [He1 [Ho1 [[nx1 [Hns1 Hnx1]] [ex1 [Hes1 Hex1]]]]]]].
+    assert (Hc1 : cenv_below rho k1) by (intros y j Hy; apply Hc in Hy; lia).
+    destruct (trans k1 ns1 es1 rho e2) as [[[k2 ns2] es2] o2] eqn:E2.
+    destruct (IH2 _ _ _ _ _ _ _ _ E2 Hn1 He1 Hc1)
+      as [Hk2 [Hn2 [He2 [Ho2 [[nx2 [Hns2 Hnx2]] [ex2 [Hes2 Hex2]]]]]]].
+    injection Htr as <- <- <- <-. subst ns2 es2 ns1 es1. unfold fresh_post.
+    split; [lia|]. split; [|split; [|split; [lia|split]]].
+    + intros i nd [H|H]; [inversion H; lia | apply Hn2 in H; lia].
+    + intros s sp t tp [H|[H|H]];
+        [inversion H; subst; lia | inversion H; subst; lia | apply He2 in H; lia].
+    + exists ((k2, DBin o) :: nx2 ++ nx1)%list. split; [rewrite app_assoc; reflexivity|].
+      intros i nd [H|H]; [inversion H; lia|].
+      apply in_app_iff in H as [H|H]; [apply Hnx2 in H | apply Hnx1 in H]; lia.
+    + exists ((o1, oport, k2, "0") :: (o2, oport, k2, "1") :: ex2 ++ ex1)%list.
+      split; [rewrite app_assoc; reflexivity|].
+      intros s sp t tp [H|[H|H]]; [inversion H; lia | inversion H; lia|].
+      apply in_app_iff in H as [H|H]; [apply Hex2 in H | apply Hex1 in H]; lia.
+  - inversion Htr; subst. apply leaf_fresh; assumption.
+  - destruct (trans k ns es rho e1) as [[[k1 ns1] es1] o1] eqn:E1.
+    destruct (IH1 _ _ _ _ _ _ _ _ E1 Hn He Hc)
+      as [Hk1 [Hn1 [He1 [Ho1 [[nx1 [Hns1 Hnx1]] [ex1 [Hes1 Hex1]]]]]]].
+    assert (Hc1 : cenv_below ((x, o1) :: rho) k1)
+      by (intros y j [Hy|Hy]; [inversion Hy; subst; lia | apply Hc in Hy; lia]).
+    destruct (IH2 _ _ _ _ _ _ _ _ Htr Hn1 He1 Hc1)
+      as [Hk2 [Hn2 [He2 [Ho2 [[nx2 [Hns2 Hnx2]] [ex2 [Hes2 Hex2]]]]]]].
+    subst. unfold fresh_post.
+    split; [lia|]. split; [exact Hn2|]. split; [exact He2|]. split; [exact Ho2|]. split.
+    + exists (nx2 ++ nx1)%list. split; [rewrite app_assoc; reflexivity|].
+      intros i nd H.
+      apply in_app_iff in H as [H|H]; [apply Hnx2 in H | apply Hnx1 in H]; lia.
+    + exists (ex2 ++ ex1)%list. split; [rewrite app_assoc; reflexivity|].
+      intros s sp t tp H.
+      apply in_app_iff in H as [H|H]; [apply Hex2 in H | apply Hex1 in H]; lia.
+  - inversion Htr; subst. apply leaf_fresh; assumption.
+Qed.
