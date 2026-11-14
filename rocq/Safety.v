@@ -75,6 +75,25 @@ Proof.
   - destruct (IH _ _ H). simpl; auto.
 Qed.
 
+Lemma decl_present_flookup : forall p f,
+  decl_present p f = true -> exists d, flookup p f = Some d.
+Proof.
+  induction p as [|d r IH]; intros f H; simpl in *; [discriminate|].
+  destruct (String.eqb f (fd_name d)); simpl in H; eauto.
+Qed.
+
+Lemma flookup_sig_covered : forall Sg p f s,
+  flookup_sig Sg f = Some s ->
+  forallb (fun sp => decl_present p (fst sp)) Sg = true ->
+  decl_present p f = true.
+Proof.
+  induction Sg as [|[g sg] r IH]; intros p f s Hf Hc; simpl in *; [discriminate|].
+  apply andb_true_iff in Hc as [Hg Hr].
+  destruct (String.eqb f g) eqn:E.
+  - apply String.eqb_eq in E; subst; exact Hg.
+  - eapply IH; eauto.
+Qed.
+
 (* named versions of the inner fixpoints of tc/eval *)
 Fixpoint check_args (Sg : fsig) (G : tenv) (es : list expr) (ts : list ty) : bool :=
   match es, ts with
@@ -167,10 +186,13 @@ Proof.
         destruct (check_args Sg G args ptys) eqn:Hca; [|discriminate]
     end.
     inversion Htc; subst.
-    destruct (flookup p f) as [d|] eqn:Hfd.
-    2:{ (* EApp: signature without a declaration *) admit. }
+    pose proof Hwt as Hwt'.
+    apply andb_true_iff in Hwt' as [Hdecls Hcov].
+    destruct (decl_present_flookup p f
+                (flookup_sig_covered _ _ _ _ Hsig Hcov)) as [d Hfd].
+    rewrite Hfd.
     destruct (flookup_spec _ _ _ Hfd) as [Hin Hname].
-    pose proof (proj1 (forallb_forall _ _) Hwt d Hin) as Hwd.
+    pose proof (proj1 (forallb_forall _ _) Hdecls d Hin) as Hwd.
     unfold wt_fundecl in Hwd. rewrite Hname, Hsig in Hwd.
     apply andb_true_iff in Hwd as [Hlen Hbody].
     apply Nat.eqb_eq in Hlen.
@@ -188,4 +210,4 @@ Proof.
     destruct (evargs fuel p env args) as [vs| | |]; simpl in *; try tauto.
     rewrite Hlen, (Forall2_length Sa), Nat.eqb_refl.
     eapply IH; [exact Hwt| |exact Hb]. apply agree_combine; assumption.
-Admitted.
+Qed.

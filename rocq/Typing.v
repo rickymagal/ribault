@@ -106,5 +106,9 @@ Definition wt_fundecl (Sg : fsig) (d : fundecl) : bool :=
   | None => false
   end.
 
+Definition decl_present (p : program) (f : ident) : bool :=
+  existsb (fun d => String.eqb f (fd_name d)) p.
+
 Definition wt_program (Sg : fsig) (p : program) : bool :=
-  forallb (wt_fundecl Sg) p.
+  forallb (wt_fundecl Sg) p
+  && forallb (fun s => decl_present p (fst s)) Sg.
