@@ -10,6 +10,7 @@ Inductive node :=
 | DBin   (o : binop)     (* inputs on ports "0" and "1" *)
 | DUn    (u : unop)      (* input on port "0" *)
 | DSteer                 (* guard on "g", value on "v", outputs "t"/"f" *)
+| DIf                    (* guard on "g", then taken branch on "t"/"f" (demand-driven) *)
 | DArg   (x : ident).    (* formal argument, read from the environment *)
 
 Definition nodeid := nat.
@@ -63,6 +64,13 @@ Fixpoint eval_dfg (fuel : nat) (g : dfg) (env : venv)
           | VBool true  => if String.eqb port "t" then Ok v else Err
           | VBool false => if String.eqb port "f" then Ok v else Err
           | _ => Err
+          end
+      | DIf      =>
+          g0 <- resolve "g" ;;
+          match g0 with
+          | VBool true  => resolve "t"
+          | VBool false => resolve "f"
+          | _           => Err
           end
       end
     end

@@ -150,7 +150,7 @@ Proof.
     trans k ns es rho e = (k', ns', es', out) ->
     nodes_below ns k -> edges_below es k -> cenv_below rho k ->
     fresh_post k ns es k' ns' es' out).
-  induction e as [n|b|x|u e1 IH1|o e1 IH1 e2 IH2|c e1 e2 e3|x e1 IH1 e2 IH2|f args];
+  induction e as [n|b|x|u e1 IH1|o e1 IH1 e2 IH2|e1 IH1 e2 IH2 e3 IH3|x e1 IH1 e2 IH2|f args];
     intros k ns es rho k' ns' es' out Htr Hn He Hc; cbn in Htr.
   - inversion Htr; subst. apply leaf_fresh; assumption.
   - inversion Htr; subst. apply leaf_fresh; assumption.
@@ -191,7 +191,34 @@ Proof.
       split; [rewrite app_assoc; reflexivity|].
       intros s sp t tp [H|[H|H]]; [inversion H; lia | inversion H; lia|].
       apply in_app_iff in H as [H|H]; [apply Hex2 in H | apply Hex1 in H]; lia.
-  - inversion Htr; subst. apply leaf_fresh; assumption.
+  - destruct (trans k ns es rho e1) as [[[k1 ns1] es1] oc] eqn:E1.
+    destruct (IH1 _ _ _ _ _ _ _ _ E1 Hn He Hc)
+      as [Hk1 [Hn1 [He1 [Ho1 [[nx1 [Hns1 Hnx1]] [ex1 [Hes1 Hex1]]]]]]].
+    assert (Hc1 : cenv_below rho k1) by (intros y j Hy; apply Hc in Hy; lia).
+    destruct (trans k1 ns1 es1 rho e2) as [[[k2 ns2] es2] ot] eqn:E2.
+    destruct (IH2 _ _ _ _ _ _ _ _ E2 Hn1 He1 Hc1)
+      as [Hk2 [Hn2 [He2 [Ho2 [[nx2 [Hns2 Hnx2]] [ex2 [Hes2 Hex2]]]]]]].
+    assert (Hc2 : cenv_below rho k2) by (intros y j Hy; apply Hc in Hy; lia).
+    destruct (trans k2 ns2 es2 rho e3) as [[[k3 ns3] es3] of] eqn:E3.
+    destruct (IH3 _ _ _ _ _ _ _ _ E3 Hn2 He2 Hc2)
+      as [Hk3 [Hn3 [He3 [Ho3 [[nx3 [Hns3 Hnx3]] [ex3 [Hes3 Hex3]]]]]]].
+    injection Htr as <- <- <- <-. subst ns3 es3 ns2 es2 ns1 es1. unfold fresh_post.
+    split; [lia|]. split; [|split; [|split; [lia|split]]].
+    + intros i nd [H|H]; [inversion H; lia | apply Hn3 in H; lia].
+    + intros s sp t tp [H|[H|[H|H]]];
+        [inversion H; subst; lia | inversion H; subst; lia
+        | inversion H; subst; lia | apply He3 in H; lia].
+    + exists ((k3, DIf) :: nx3 ++ nx2 ++ nx1)%list.
+      split; [rewrite !app_assoc; reflexivity|].
+      intros i nd [H|H]; [inversion H; lia|].
+      apply in_app_iff in H as [H|H]; [apply Hnx3 in H; lia|].
+      apply in_app_iff in H as [H|H]; [apply Hnx2 in H | apply Hnx1 in H]; lia.
+    + exists ((oc, oport, k3, "g") :: (ot, oport, k3, "t") :: (of, oport, k3, "f")
+              :: ex3 ++ ex2 ++ ex1)%list.
+      split; [rewrite !app_assoc; reflexivity|].
+      intros s sp t tp [H|[H|[H|H]]]; [inversion H; lia | inversion H; lia | inversion H; lia|].
+      apply in_app_iff in H as [H|H]; [apply Hex3 in H; lia|].
+      apply in_app_iff in H as [H|H]; [apply Hex2 in H | apply Hex1 in H]; lia.
   - destruct (trans k ns es rho e1) as [[[k1 ns1] es1] o1] eqn:E1.
     destruct (IH1 _ _ _ _ _ _ _ _ E1 Hn He Hc)
       as [Hk1 [Hn1 [He1 [Ho1 [[nx1 [Hns1 Hnx1]] [ex1 [Hes1 Hex1]]]]]]].
@@ -225,6 +252,8 @@ Proof.
     destruct (lookup_node (dnodes g) m) as [nd|]; [| discriminate H].
     destruct nd; cbn in H |- *; try exact H;
     repeat match type of H with
+      | context [match ?A with VInt _ => _ | VBool _ => _ end] =>
+          destruct A as [?|[|]]; cbn in H |- *; try discriminate H
       | context [feeder ?E ?M ?P] =>
           let Ef := fresh "Ef" in
           destruct (feeder E M P) as [[? ?]|] eqn:Ef; cbn in H |- *;

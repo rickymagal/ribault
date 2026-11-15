@@ -66,7 +66,12 @@ Fixpoint trans (k : nat) (ns : list (nodeid * node))
   | ELet x e1 e2 =>
       let '(k1, ns1, es1, o1) := trans k ns es rho e1 in
       trans k1 ns1 es1 ((x, o1) :: rho) e2
-  | EIf  _ _ _ => (S k, (k, DConst 0) :: ns, es, k)  (* control: dedicated WO *)
+  | EIf c t f =>
+      let '(k1, ns1, es1, oc) := trans k  ns  es  rho c in
+      let '(k2, ns2, es2, ot) := trans k1 ns1 es1 rho t in
+      let '(k3, ns3, es3, of) := trans k2 ns2 es2 rho f in
+      (S k3, (k3, DIf) :: ns3,
+             (oc, oport, k3, "g") :: (ot, oport, k3, "t") :: (of, oport, k3, "f") :: es3, k3)
   | EApp _ _   => (S k, (k, DConst 0) :: ns, es, k)  (* call: dedicated WO *)
   end.
 
