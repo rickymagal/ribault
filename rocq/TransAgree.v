@@ -65,6 +65,20 @@ Lemma eval_dfg_bin_step : forall fd k2 o ns2 o1 o2 es2 denv,
           (fun a => rbind (eval_dfg fd G denv o2 oport) (fun b => eval_bin o a b)).
 Proof. intros. cbn. rewrite Nat.eqb_refl. reflexivity. Qed.
 
+(* one evaluation step of the conditional node trans builds for EIf *)
+Lemma eval_dfg_if_step : forall fd k3 ns3 oc ot of es3 denv,
+  let G := {| dnodes := (k3, DIf) :: ns3;
+              dedges := (oc, oport, k3, "g") :: (ot, oport, k3, "t")
+                        :: (of, oport, k3, "f") :: es3 |} in
+  eval_dfg (S fd) G denv k3 "0"
+  = rbind (eval_dfg fd G denv oc oport)
+          (fun g0 => match g0 with
+                     | VBool true  => eval_dfg fd G denv ot oport
+                     | VBool false => eval_dfg fd G denv of oport
+                     | _           => Err
+                     end).
+Proof. intros. cbn. rewrite Nat.eqb_refl. reflexivity. Qed.
+
 (* the fresh-prefix hypotheses of eval_dfg_extend for a one-node,
    few-edge top-level addition at id k *)
 Lemma single_node_fresh : forall (k : nodeid) (nd : node) (i : nodeid) (nd' : node),
@@ -85,7 +99,9 @@ Theorem trans_agree :
       eval fe prog senv e = Ok v ->
       exists fd, eval_dfg fd {| dnodes := ns'; dedges := es' |} denv out "0" = Ok v.
 Proof.
-  intros e. induction e; intros k ns es rho k' ns' es' out senv denv prog
+  intros e.
+  induction e as [n|b|x|u e IHe|o e1 IHe1 e2 IHe2|c IHc t IHt f IHf|x e1 IHe1 e2 IHe2|g args];
+    intros k ns es rho k' ns' es' out senv denv prog
                                  Htr Hsl Hn He Hc [Hfree Hbound] fe v Hev;
     cbn in Htr; (destruct fe as [|fe]; [cbn in Hev; discriminate Hev|]); cbn in Hev;
     cbn in Hsl.
@@ -182,7 +198,111 @@ Proof.
     end.
     rewrite R2. exact Hev.
   - (* EIf *)
-    discriminate Hsl.
+    rewrite !andb_true_iff in Hsl. destruct Hsl as [[Hslc Hslt] Hslf].
+    destruct (trans k  ns  es  rho c) as [[[k1 ns1] es1] oc] eqn:E1.
+    destruct (trans k1 ns1 es1 rho t) as [[[k2 ns2] es2] ot] eqn:E2.
+    destruct (trans k2 ns2 es2 rho f) as [[[k3 ns3] es3] of] eqn:E3.
+    injection Htr as <- <- <- <-.
+    destruct (eval fe prog senv c) as [vc| | |] eqn:Eec; cbn in Hev; try discriminate Hev.
+    destruct vc as [nc|bc]; [discriminate Hev|].
+    destruct (trans_fresh c k ns es rho k1 ns1 es1 oc E1 Hn He Hc)
+      as [Hkk1 [Hnb1 [Heb1 [Hoc [[nx1 [Hns1 Hnx1]] [ex1 [Hes1 Hex1]]]]]]].
+    assert (Hc1 : cenv_below rho k1) by (intros y j Hin; apply Hc in Hin; lia).
+    destruct (trans_fresh t k1 ns1 es1 rho k2 ns2 es2 ot E2 Hnb1 Heb1 Hc1)
+      as [Hk12 [Hnb2 [Heb2 [Hot [[nx2 [Hns2 Hnx2]] [ex2 [Hes2 Hex2]]]]]]].
+    assert (Hc2 : cenv_below rho k2) by (intros y j Hin; apply Hc in Hin; lia).
+    destruct (trans_fresh f k2 ns2 es2 rho k3 ns3 es3 of E3 Hnb2 Heb2 Hc2)
+      as [Hk23 [Hnb3 [Heb3 [Hof _]]]].
+    assert (Hinv1 : env_inv rho senv denv ns1 es1).
+    { rewrite Hns1, Hes1.
+      apply (env_inv_mono rho senv denv ns es nx1 ex1 k Hc He).
+      - intros i nd Hin. apply (proj1 (Hnx1 i nd Hin)).
+      - intros s sp tt tp Hin. apply (proj1 (Hex1 s sp tt tp Hin)).
+      - exact (conj Hfree Hbound). }
+    assert (Hinv2 : env_inv rho senv denv ns2 es2).
+    { rewrite Hns2, Hes2.
+      apply (env_inv_mono rho senv denv ns1 es1 nx2 ex2 k1 Hc1 Heb1).
+      - intros i nd Hin. apply (proj1 (Hnx2 i nd Hin)).
+      - intros s sp tt tp Hin. apply (proj1 (Hex2 s sp tt tp Hin)).
+      - exact Hinv1. }
+    destruct (IHc k ns es rho k1 ns1 es1 oc senv denv prog
+                  E1 Hslc Hn He Hc (conj Hfree Hbound) fe (VBool bc) Eec) as [fdc Hfdc].
+    assert (Hex3 : forall s sp tt tp,
+              In (s, sp, tt, tp)
+                 [(oc, oport, k3, "g"); (ot, oport, k3, "t"); (of, oport, k3, "f")] ->
+              k3 <= tt)
+      by (intros s sp tt tp [H|[H|[H|[]]]]; inversion H; lia).
+    (* lift a value at node o < k3 from (ns3,es3) to the output graph *)
+    assert (Lift3 : forall F o r, o < k3 ->
+              eval_dfg F {| dnodes := ns3; dedges := es3 |} denv o "0" = r ->
+              eval_dfg F {| dnodes := (k3, DIf) :: ns3;
+                            dedges := (oc, oport, k3, "g") :: (ot, oport, k3, "t")
+                                      :: (of, oport, k3, "f") :: es3 |} denv o "0" = r).
+    { intros F o r Ho Hr.
+      pose proof (eval_dfg_extend F [(k3, DIf)]
+                    [(oc, oport, k3, "g"); (ot, oport, k3, "t"); (of, oport, k3, "f")]
+                    ns3 es3 denv k3 Heb3 (single_node_fresh k3 DIf) Hex3 o "0" Ho) as X.
+      etransitivity; [symmetry; exact X| exact Hr]. }
+    (* the guard, lifted through t, f and the DIf node *)
+    assert (Ag : forall F, fdc <= F ->
+              eval_dfg F {| dnodes := (k3, DIf) :: ns3;
+                            dedges := (oc, oport, k3, "g") :: (ot, oport, k3, "t")
+                                      :: (of, oport, k3, "f") :: es3 |} denv oc "0"
+              = Ok (VBool bc)).
+    { intros F HF. apply Lift3; [lia|].
+      etransitivity;
+        [symmetry; exact (eval_dfg_trans_stable f k2 ns2 es2 rho k3 ns3 es3 of denv oc "0" F
+                            E3 Hnb2 Heb2 Hc2 ltac:(lia))|].
+      etransitivity;
+        [symmetry; exact (eval_dfg_trans_stable t k1 ns1 es1 rho k2 ns2 es2 ot denv oc "0" F
+                            E2 Hnb1 Heb1 Hc1 Hoc)|].
+      exact (eval_dfg_fuel_mono fdc _ _ _ _ _ Hfdc F HF). }
+    destruct bc.
+    + destruct (IHt k1 ns1 es1 rho k2 ns2 es2 ot senv denv prog
+                    E2 Hslt Hnb1 Heb1 Hc1 Hinv1 fe v Hev) as [fdt Hfdt].
+      set (F := Nat.max fdc fdt).
+      assert (At : eval_dfg F {| dnodes := (k3, DIf) :: ns3;
+                                 dedges := (oc, oport, k3, "g") :: (ot, oport, k3, "t")
+                                           :: (of, oport, k3, "f") :: es3 |} denv ot "0"
+                   = Ok v).
+      { apply Lift3; [lia|].
+        etransitivity;
+          [symmetry; exact (eval_dfg_trans_stable f k2 ns2 es2 rho k3 ns3 es3 of denv ot "0" F
+                              E3 Hnb2 Heb2 Hc2 Hot)|].
+        exact (eval_dfg_fuel_mono fdt _ _ _ _ _ Hfdt F (Nat.le_max_r _ _)). }
+      pose proof (Ag F (Nat.le_max_l _ _)) as Agt.
+      exists (S F). rewrite eval_dfg_if_step. unfold oport in *.
+      match goal with
+      | |- rbind ?r _ = _ => assert (R : r = Ok (VBool true)) by exact Agt
+      end.
+      rewrite R. cbn [rbind].
+      match goal with
+      | |- ?r = _ => change r with (eval_dfg F {| dnodes := (k3, DIf) :: ns3;
+                         dedges := (oc, "0", k3, "g") :: (ot, "0", k3, "t")
+                                   :: (of, "0", k3, "f") :: es3 |} denv ot "0")
+      end.
+      exact At.
+    + destruct (IHf k2 ns2 es2 rho k3 ns3 es3 of senv denv prog
+                    E3 Hslf Hnb2 Heb2 Hc2 Hinv2 fe v Hev) as [fdf Hfdf].
+      set (F := Nat.max fdc fdf).
+      assert (Af : eval_dfg F {| dnodes := (k3, DIf) :: ns3;
+                                 dedges := (oc, oport, k3, "g") :: (ot, oport, k3, "t")
+                                           :: (of, oport, k3, "f") :: es3 |} denv of "0"
+                   = Ok v).
+      { apply Lift3; [exact Hof|].
+        exact (eval_dfg_fuel_mono fdf _ _ _ _ _ Hfdf F (Nat.le_max_r _ _)). }
+      pose proof (Ag F (Nat.le_max_l _ _)) as Agf.
+      exists (S F). rewrite eval_dfg_if_step. unfold oport in *.
+      match goal with
+      | |- rbind ?r _ = _ => assert (R : r = Ok (VBool false)) by exact Agf
+      end.
+      rewrite R. cbn [rbind].
+      match goal with
+      | |- ?r = _ => change r with (eval_dfg F {| dnodes := (k3, DIf) :: ns3;
+                         dedges := (oc, "0", k3, "g") :: (ot, "0", k3, "t")
+                                   :: (of, "0", k3, "f") :: es3 |} denv of "0")
+      end.
+      exact Af.
   - (* ELet *)
     apply andb_true_iff in Hsl as [Hsl1 Hsl2].
     destruct (trans k ns es rho e1) as [[[k1 ns1] es1] o1] eqn:E1.

@@ -16,7 +16,7 @@ Fixpoint straight_line (e : expr) : bool :=
   | EUn _ e1      => straight_line e1
   | EBin _ e1 e2  => straight_line e1 && straight_line e2
   | ELet _ e1 e2  => straight_line e1 && straight_line e2
-  | EIf _ _ _     => false
+  | EIf c t f     => straight_line c && straight_line t && straight_line f
   | EApp _ _      => false
   end.
 
