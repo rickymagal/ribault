@@ -1,3 +1,3 @@
-[submodule "external/TALM"]
-	path = external/TALM
+[submodule "TALM"]
+	path = TALM
 	url = https://github.com/tiagoaoa/TALM

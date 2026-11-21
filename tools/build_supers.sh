@@ -413,7 +413,7 @@ build_libsupers_so() {
   local rr
   rr="$(repo_root)"
   local rts_init_src="$rr/tools/supers_rts_init.c"
-  cflags="$cflags -I${TALM_DIR:-$rr/external/TALM}/interp/include"
+  cflags="$cflags -I${TALM_DIR:-$rr/TALM}/interp/include"
 
   # Add RTS include dirs so gcc can find HsFFI.h
   local rts_inc_dirs

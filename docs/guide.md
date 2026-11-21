@@ -167,14 +167,14 @@ libsupers.so
 
 Example:
 ```
-external/TALM/interp/interp 1 program.flb program.pla libsupers.so
+TALM/interp/interp 1 program.flb program.pla libsupers.so
 ```
 
 ## 8) Generating from a new program (not in test/)
 
 1) Write your `program.hsk`
 2) Run the toolchain above (codegen + assembler + supersgen + build_supers)
-3) Execute with `external/TALM/interp/interp`
+3) Execute with `TALM/interp/interp`
 
 You do not need to place the program under `test/` for this flow.
 

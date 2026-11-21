@@ -19,20 +19,20 @@ This work proposes the translation of programs written in a Haskell subset into 
 | `src/Synthesis` | Dataflow + TALM code generation. |
 | `test/` | Unit test programs (`*.hss`); `make` renders AST/DF artifacts here (git-ignored). |
 | `tools/` | Supers build helpers + Haddock API docs builder (`build_module_docs.sh`). |
-| `external/TALM/` | Trebuchet interpreter + assembler (git submodule → [tiagoaoa/TALM](https://github.com/tiagoaoa/TALM), pinned). |
+| `TALM/` | Trebuchet interpreter + assembler (git submodule → [tiagoaoa/TALM](https://github.com/tiagoaoa/TALM), pinned). |
 
 ## Build / Targets
 
 Prerequisites: `ghc`, `alex`, `happy`, `dot` (Graphviz), `python3`, `gcc`.
-The TALM interpreter/assembler is the `external/TALM` git submodule
+The TALM interpreter/assembler is the `TALM` git submodule
 ([tiagoaoa/TALM](https://github.com/tiagoaoa/TALM), pinned by SHA). Initialize it
 before building:
 
 ```bash
-git submodule update --init external/TALM
+git submodule update --init TALM
 ```
 
-`TALM_DIR` overrides the path (default: `external/TALM`), e.g. `make TALM_DIR=/path/to/TALM`.
+`TALM_DIR` overrides the path (default: `TALM`), e.g. `make TALM_DIR=/path/to/TALM`.
 
 ```bash
 # Build everything for test programs
@@ -75,10 +75,10 @@ tools/build_supers.sh /path/to/myprog.hsk /tmp/myprog_supers/Supers.hs
 
 ## Running on TALM (Trebuchet)
 
-`TALM_DIR` points at the TALM checkout (default: `external/TALM`; set it to use another one):
+`TALM_DIR` points at the TALM checkout (default: `TALM`; set it to use another one):
 
 ```bash
-TALM_DIR=external/TALM
+TALM_DIR=TALM
 P=8
 
 # Assemble

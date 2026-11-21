@@ -5,7 +5,7 @@ GHC         := ghc
 ALEX        := alex
 HAPPY       := happy
 DOT         := dot
-TALM_DIR ?= external/TALM
+TALM_DIR ?= TALM
 
 # -------- directories -------------------------------------------
 SRC_DIR     := src

@@ -31,7 +31,7 @@ main = do
       buildDir = "build" </> baseName
 
   createDirectoryIfMissing True buildDir
-  talmDir <- maybe (repoRoot </> "external" </> "TALM") id <$> lookupEnv "TALM_DIR"
+  talmDir <- maybe (repoRoot </> "TALM") id <$> lookupEnv "TALM_DIR"
 
   -- 1. Codegen: .hss → .fl
   src <- readFile file
